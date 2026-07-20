@@ -33,7 +33,8 @@ this canary.
 ## Maintainer procedure
 
 First confirm that the package does not already exist when testing first-package
-creation. Then request the read-only build and verification graph:
+creation. The conservative sequence starts with the read-only build and
+verification graph:
 
 ```bash
 gh api -X POST repos/brandonpayton/homebrew-kandelo-canary/dispatches \
@@ -50,6 +51,13 @@ gh api -X POST repos/brandonpayton/homebrew-kandelo-canary/dispatches \
   -f 'client_payload[formulae]=hello' \
   -f 'client_payload[arches]=wasm32'
 ```
+
+For the initial first-package canary, maintainers may intentionally defer the
+dry run when fast end-to-end proof is more valuable than avoiding a failed
+upload attempt. The write workflow contains the same pre-upload planning,
+build, and local handoff validation. It then exercises the critical behavior a
+dry run cannot test: public package creation followed by credential-free digest
+readback. Record that throughput decision with the run evidence.
 
 Do not add `HOMEBREW_GITHUB_PACKAGES_TOKEN` or another package secret. The
 caller grants a permission ceiling of `actions: read`, `contents: write`, and
