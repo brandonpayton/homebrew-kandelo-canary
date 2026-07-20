@@ -9,6 +9,12 @@ class Hello < Formula
   sha256 "0d5f60154382fee10b114a1c34e785d8b1f492073ae2d3a6f7b147687b366aa0"
   license "GPL-3.0-or-later"
 
+  bottle do
+    root_url "https://ghcr.io/v2/brandonpayton/homebrew-kandelo-canary"
+    rebuild 1
+    sha256 cellar: :any_skip_relocation, wasm32_kandelo: "d1c02e66c7e4d2b11935d521320c91797493c5fafeb7c518c742b6030b00244e"
+  end
+
   depends_on "binaryen" => :build
   depends_on "wabt" => :build
 
