@@ -62,7 +62,7 @@ class M4 < Formula
   bottle do
     root_url "https://ghcr.io/v2/brandonpayton/homebrew-kandelo-canary"
     rebuild 2
-    sha256 cellar: :any_skip_relocation, wasm32_kandelo: "d5efd2050c4fbd04fa18996609d53335f3a5dabb35e1f72cdb5f88c29affd7b7"
+    sha256 cellar: :any_skip_relocation, wasm32_kandelo: "4eececd5404f9063b7fbbb5eeca3cd9f0c3171056aec37aec5c29536c23e1970"
   end
 end
 
