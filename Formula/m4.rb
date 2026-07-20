@@ -58,6 +58,12 @@ class M4 < Formula
         bin/"m4", [], env: { "KERNEL_CWD" => testpath, "KERNEL_PATH" => testpath }, stdin: source
       )
   end
+
+  bottle do
+    root_url "https://ghcr.io/v2/brandonpayton/homebrew-kandelo-canary"
+    rebuild 1
+    sha256 cellar: :any_skip_relocation, wasm32_kandelo: "c6e02dc01c8e53f293dcf156c0b72b156b437f8b8ffa60ec1976946204ab0fd3"
+  end
 end
 
 __END__
