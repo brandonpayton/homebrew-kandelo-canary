@@ -1,0 +1,8 @@
+{
+  "schema": 1,
+  "formula": "m4",
+  "brewfile": "Kandelo/vfs-acceptance.Brewfile",
+  "executable": "/home/linuxbrew/.linuxbrew/bin/m4",
+  "argv": ["m4", "--version"],
+  "expected_stdout": "GNU M4) 1.4.21"
+}

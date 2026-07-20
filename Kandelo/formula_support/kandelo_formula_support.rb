@@ -18,7 +18,14 @@ require "shellwords"
 # accepted Tier-2 deviation (spec §6) for heavy ported formulae (ruby/perl/…)
 # whose 49 KB `build-<name>.sh` is not yet decomposed into idiomatic steps.
 module KandeloFormulaSupport
-  KANDELO_TAP_FORMULA_PREFIX = "brandonpayton/kandelo-canary/"
+  KANDELO_TARGET_FORMULA_PREFIXES = %w[
+    brandonpayton/kandelo-canary/
+    kandelo-dev/tap-core/
+  ].freeze
+
+  def kandelo_target_formula?(formula_name)
+    KANDELO_TARGET_FORMULA_PREFIXES.any? { |prefix| formula_name.start_with?(prefix) }
+  end
 
   # Homebrew's formula_opt_* helpers discard the tap name and resolve through
   # HOMEBREW_PREFIX/opt. A native formula alias can therefore redirect a
@@ -26,7 +33,7 @@ module KandeloFormulaSupport
   # dependencies to their exact installed keg; Formulae still map those host
   # paths to stable guest opt paths in their compiler and runtime contracts.
   def formula_opt_prefix(formula_name)
-    return Utils::Path.formula_opt_prefix(formula_name) unless formula_name.start_with?(KANDELO_TAP_FORMULA_PREFIX)
+    return Utils::Path.formula_opt_prefix(formula_name) unless kandelo_target_formula?(formula_name)
 
     kandelo_formula_prefix(formula_name)
   end
@@ -217,7 +224,7 @@ module KandeloFormulaSupport
 
   def kandelo_target_runtime_dependencies
     runtime_formula_dependencies(read_from_tab: false, undeclared: false).select do |dependency|
-      dependency.full_name.start_with?(KANDELO_TAP_FORMULA_PREFIX)
+      kandelo_target_formula?(dependency.full_name)
     end
   end
 
