@@ -14,13 +14,13 @@ This repository is an integration canary, not a supported end-user tap.
 
 ## What this proves
 
-Together, the two successful write runs prove all of the following:
+The completed `m4` write proves all of the following:
 
 1. a public third-party tap can call Kandelo's reviewed reusable publisher;
 2. repository identity and Homebrew tap identity remain distinct and correct;
-3. the repository's built-in `GITHUB_TOKEN` can create packages such as
-   `homebrew-kandelo-canary/hello` in GitHub Container Registry (GHCR);
-4. the repository's first package was public without a visibility-changing API
+3. the repository's built-in `GITHUB_TOKEN` can create
+   `homebrew-kandelo-canary/m4` in GitHub Container Registry (GHCR);
+4. the package was public without a visibility-changing API
    call or a personal access token;
 5. the publisher can anonymously read the exact uploaded digest before it
    commits Formula and Kandelo sidecar metadata; and
@@ -30,21 +30,10 @@ Together, the two successful write runs prove all of the following:
 
 The `homebrew-` prefix in the GHCR namespace is intentional. It binds the
 package to this public source repository; shortening the destination to
-`kandelo-canary/hello` exercises a different package-creation path and is not
+`kandelo-canary/m4` exercises a different package-creation path and is not
 this canary.
 
 ## Maintainer procedure
-
-The two write canaries are intentionally independent. `hello` is the smallest
-third-party/public-package proof and does not request VFS closure acceptance:
-
-```bash
-gh api -X POST repos/brandonpayton/homebrew-kandelo-canary/dispatches \
-  -f event_type=publish-kandelo-bottles \
-  -f 'client_payload[formulae]=hello' \
-  -f 'client_payload[arches]=wasm32' \
-  -F 'client_payload[require_vfs_acceptance]=false'
-```
 
 `m4` is the smallest dependency-bearing proof in this canary. Its Formula
 truthfully uses the core tap's `dash` as the configured runtime shell. This
@@ -62,8 +51,9 @@ gh api -X POST repos/brandonpayton/homebrew-kandelo-canary/dispatches \
 The write workflow contains the same pre-upload planning, build, and local
 handoff validation as the dry-run workflow. It additionally exercises the
 critical behavior a dry run cannot test: public package creation followed by
-credential-free digest readback. Keep the two runs separate so a VFS or
-cross-tap failure cannot obscure the minimal public-package result.
+credential-free digest readback. The completed run also proves cross-tap VFS
+composition and immutable release publication, so the earlier single-package
+pilot is no longer part of the active canary.
 
 Do not add `HOMEBREW_GITHUB_PACKAGES_TOKEN` or another package secret. The
 caller grants a permission ceiling of `actions: read`, `contents: write`, and
