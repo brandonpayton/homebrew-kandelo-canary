@@ -1,0 +1,12 @@
+{
+  "schema": 1,
+  "formula": "m4",
+  "arch": "wasm32",
+  "release_tag": "bottles-abi-v41",
+  "status": "failed",
+  "attempted_at": "2026-07-20T15:13:11Z",
+  "attempted_by": "https://github.com/brandonpayton/homebrew-kandelo-canary/actions/runs/29752138855",
+  "kandelo_commit": "e98c6eb5e2cdd2f4e0212d2dad24df1dd6f3ef95",
+  "tap_commit": "b2957535ac3f24e224d69e40f4c6ca9f3c2448d8",
+  "error": "publish-handoff=failure; validate-payload=skipped; publish=skipped"
+}
