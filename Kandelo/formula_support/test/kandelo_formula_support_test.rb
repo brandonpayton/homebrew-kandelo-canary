@@ -106,7 +106,7 @@ class KandeloFormulaSupportTest < Minitest::Test
   def test_target_formula_identity_includes_calling_and_core_taps
     harness = Harness.new
 
-    assert harness.kandelo_target_formula?("brandonpayton/kandelo-canary/hello")
+    assert harness.kandelo_target_formula?("brandonpayton/kandelo-canary/m4")
     assert harness.kandelo_target_formula?("kandelo-dev/tap-core/dash")
     refute harness.kandelo_target_formula?("homebrew/core/dash")
   end
