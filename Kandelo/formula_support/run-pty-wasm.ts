@@ -15,6 +15,16 @@ import {
   parseExpectedForkDescendants,
   type ProcessEvent,
 } from "./fork-descendant-statuses.ts";
+import {
+  createPtyOutputReadiness,
+  type PtyOutputReadiness,
+} from "./pty-output-readiness.ts";
+import {
+  createPtyCompletionOutputTracker,
+  validatePtyCompletionOutput,
+  waitForPtyCompletion,
+  type PtyCompletionOutputTracker,
+} from "./pty-completion-output.ts";
 import { rootfsSizeForStagedBytes, validateGuestPath } from "./rootfs-size.ts";
 
 const O_WRONLY = 0x0001;
@@ -22,11 +32,14 @@ const O_CREAT = 0x0040;
 const O_TRUNC = 0x0200;
 const S_IFMT = 0xf000;
 const S_IFDIR = 0x4000;
+const MAX_PTY_CONFIG_BYTES = 16 * 1024 * 1024;
+const MAX_INPUT_READY_TEXT_BYTES = 4 * 1024;
 
 interface PtyConfig {
   argv0?: string | null;
   env: Record<string, string>;
   inputs: string[];
+  inputReadyText?: string | null;
   rerunInputs?: string[] | null;
   execPrograms?: Record<string, string>;
   guestFiles?: Record<string, string>;
@@ -37,6 +50,8 @@ interface PtyConfig {
   inputDelayMs: number;
   cols: number;
   rows: number;
+  timeoutMs?: number | null;
+  completionOutput?: string | null;
   expectedForkDescendants?: number;
 }
 
@@ -115,21 +130,58 @@ async function main(): Promise<void> {
     throw new Error("usage: run-pty-wasm.ts KANDELO_ROOT PROGRAM [ARGS...]");
   }
 
-  const config = JSON.parse(
-    process.env.KANDELO_FORMULA_PTY_CONFIG_JSON ?? "{}",
-  ) as PtyConfig;
-  if (!Array.isArray(config.inputs)) {
+  const configPath = process.env.KANDELO_FORMULA_PTY_CONFIG_PATH;
+  if (!configPath) {
+    throw new Error("KANDELO_FORMULA_PTY_CONFIG_PATH is required");
+  }
+  let configStat: ReturnType<typeof statSync>;
+  try {
+    configStat = statSync(configPath);
+  } catch (error) {
+    throw new Error(`PTY config file is unavailable: ${String(error)}`);
+  }
+  if (!configStat.isFile() || configStat.size <= 0 || configStat.size > MAX_PTY_CONFIG_BYTES) {
     throw new Error(
-      "KANDELO_FORMULA_PTY_CONFIG_JSON must contain an inputs array",
+      `PTY config file must be a nonempty regular file no larger than ${MAX_PTY_CONFIG_BYTES} bytes`,
+    );
+  }
+  let config: PtyConfig;
+  try {
+    config = JSON.parse(readFileSync(configPath, "utf8")) as PtyConfig;
+  } catch (error) {
+    throw new Error(`PTY config JSON is malformed: ${String(error)}`);
+  }
+  if (!Array.isArray(config.inputs)) {
+    throw new Error("PTY config JSON must contain an inputs array");
+  }
+  if (
+    config.inputReadyText != null &&
+    (typeof config.inputReadyText !== "string" ||
+      config.inputReadyText.length === 0 ||
+      new TextEncoder().encode(config.inputReadyText).byteLength >
+        MAX_INPUT_READY_TEXT_BYTES)
+  ) {
+    throw new Error(
+      `inputReadyText must be a nonempty string no larger than ${MAX_INPUT_READY_TEXT_BYTES} bytes`,
     );
   }
   if (config.rerunInputs != null && !Array.isArray(config.rerunInputs)) {
     throw new Error("rerunInputs must be an array when present");
   }
+  if (
+    config.timeoutMs != null &&
+    (!Number.isSafeInteger(config.timeoutMs) || config.timeoutMs <= 0)
+  ) {
+    throw new Error("timeoutMs must be a positive integer");
+  }
+  const completionOutput = validatePtyCompletionOutput(
+    config.completionOutput,
+  );
   const expectedForkDescendants = parseExpectedForkDescendants(
     String(config.expectedForkDescendants ?? 0),
     undefined,
   );
+  const inputReadyText = config.inputReadyText ?? undefined;
 
   const configuredArgv0 = config.argv0 ?? undefined;
   if (configuredArgv0 !== undefined) validateGuestPath(configuredArgv0, []);
@@ -382,41 +434,44 @@ async function main(): Promise<void> {
     }
 
     let forkDescendants = createForkDescendantTracker();
+    let activeOutputReadiness: PtyOutputReadiness | undefined;
+    let completionTracker: PtyCompletionOutputTracker | undefined;
+    const observeOutput = (
+      destination: NodeJS.WriteStream,
+      data: Uint8Array,
+    ): void => {
+      destination.write(data);
+      completionTracker?.observe(data);
+    };
     const host = new NodeKernelHost({
       maxWorkers: 4,
       execPrograms,
       rootfsImage,
       extraMounts,
-      onPtyOutput: (_pid: number, data: Uint8Array) =>
-        process.stdout.write(data),
-      onStderr: (_pid: number, data: Uint8Array) => process.stderr.write(data),
+      onPtyOutput: (_pid: number, data: Uint8Array) => {
+        activeOutputReadiness?.observe(data);
+        observeOutput(process.stdout, data);
+      },
+      onStderr: (_pid: number, data: Uint8Array) =>
+        observeOutput(process.stderr, data),
       onProcessEvent: (event: ProcessEvent) =>
         forkDescendants.onProcessEvent(event),
     });
 
     try {
       await host.init();
-      const timeoutMs = Number.parseInt(
-        guestEnv.TIMEOUT ?? process.env.TIMEOUT ?? "30000",
-        10,
-      );
+      const timeoutMs =
+        config.timeoutMs ??
+        Number.parseInt(guestEnv.TIMEOUT ?? process.env.TIMEOUT ?? "30000", 10);
       const run = async (inputs: string[]): Promise<number> => {
         forkDescendants = createForkDescendantTracker();
+        completionTracker = completionOutput
+          ? createPtyCompletionOutputTracker(completionOutput)
+          : undefined;
         const deadline = Date.now() + timeoutMs;
-        const exit = host.spawn(program, [argv0, ...args], {
-          cwd: guestEnv.KERNEL_CWD ?? (rootfsImage ? "/" : process.cwd()),
-          env,
-          pty: true,
-          ptyCols: config.cols ?? 100,
-          ptyRows: config.rows ?? 30,
-          onStarted: async (pid: number) => {
-            await delay(config.initialDelayMs ?? 500);
-            for (const input of inputs) {
-              host.ptyWrite(pid, new TextEncoder().encode(input));
-              await delay(config.inputDelayMs ?? 180);
-            }
-          },
-        });
+        activeOutputReadiness = inputReadyText
+          ? createPtyOutputReadiness(inputReadyText)
+          : undefined;
         let timer: ReturnType<typeof setTimeout> | undefined;
         const timeout = new Promise<number>((_resolve, reject) => {
           timer = setTimeout(
@@ -424,8 +479,30 @@ async function main(): Promise<void> {
             timeoutMs,
           );
         });
+        const exit = host.spawn(program, [argv0, ...args], {
+          cwd: guestEnv.KERNEL_CWD ?? (rootfsImage ? "/" : process.cwd()),
+          env,
+          pty: true,
+          ptyCols: config.cols ?? 100,
+          ptyRows: config.rows ?? 30,
+          onStarted: async (pid: number) => {
+            if (activeOutputReadiness) {
+              await Promise.race([activeOutputReadiness.wait(), timeout]);
+            } else {
+              await delay(config.initialDelayMs ?? 500);
+            }
+            for (const input of inputs) {
+              host.ptyWrite(pid, new TextEncoder().encode(input));
+              await delay(config.inputDelayMs ?? 180);
+            }
+          },
+        });
         try {
-          const status = await Promise.race([exit, timeout]);
+          const status = await waitForPtyCompletion(
+            exit,
+            timeout,
+            completionTracker,
+          );
           if (status === 0 && expectedForkDescendants.count > 0) {
             await Promise.race([
               forkDescendants.waitFor(expectedForkDescendants, deadline),
@@ -434,7 +511,9 @@ async function main(): Promise<void> {
           }
           return status;
         } finally {
+          completionTracker = undefined;
           if (timer) clearTimeout(timer);
+          activeOutputReadiness = undefined;
         }
       };
 

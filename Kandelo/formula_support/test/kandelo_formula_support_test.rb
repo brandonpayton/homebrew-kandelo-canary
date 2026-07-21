@@ -5,6 +5,7 @@ require "minitest/autorun"
 require "open3"
 # Standalone Ruby does not preload Homebrew's Pathname helper.
 require "pathname" # rubocop:disable Lint/RedundantRequireStatement
+require "rbconfig"
 require "tmpdir"
 require_relative "../kandelo_formula_support"
 
@@ -12,14 +13,18 @@ require_relative "../kandelo_formula_support"
 class KandeloFormulaSupportTest < Minitest::Test
   DependencyFormula = Struct.new(:full_name, :opt_bin, :opt_sbin, :opt_libexec, keyword_init: true)
   InstalledFormula = Struct.new(:rack, :pkg_version, keyword_init: true)
+  StableSpec = Struct.new(:url, :checksum, keyword_init: true)
+  StableChecksum = Struct.new(:hexdigest, keyword_init: true)
 
   # Minimal Formula double for command-construction tests.
   class Harness
     include KandeloFormulaSupport
 
-    attr_accessor :build_path, :dependency_formulae, :homebrew_prefix_path, :nix_path, :prefix_path, :root_path,
-                  :runtime_formulae, :shell_result, :test_path
-    attr_reader :command, :expected_status, :recorded_launcher, :system_args, :system_calls
+    attr_accessor :build_path, :dependency_formulae, :formula_full_name, :formula_name, :formula_path,
+                  :formula_version, :homebrew_prefix_path, :nix_path, :prefix_path, :root_path,
+                  :runtime_formulae, :shell_result, :stable_spec, :test_path, :tier2_runtime
+    attr_reader :command, :expected_status, :pty_config, :pty_config_mode, :pty_config_path,
+                :recorded_launcher, :system_args, :system_calls, :system_environment
 
     def kandelo_require_root!
       root_path || "/tmp/kandelo root"
@@ -31,6 +36,35 @@ class KandeloFormulaSupportTest < Minitest::Test
 
     def buildpath
       build_path || testpath
+    end
+
+    def name
+      formula_name || "test-formula"
+    end
+
+    def version
+      formula_version || "1.0"
+    end
+
+    def full_name
+      formula_full_name || "kandelo-dev/tap-core/#{name}"
+    end
+
+    def path
+      formula_path || Pathname("/tmp/formula.rb")
+    end
+
+    def stable
+      stable_spec || StableSpec.new(
+        url: "https://example.test/test-formula-1.0.tar.gz",
+        checksum: StableChecksum.new(hexdigest: "a" * 64),
+      )
+    end
+
+    def kandelo_tier2_runtime!
+      return tier2_runtime unless tier2_runtime.nil?
+
+      super
     end
 
     def prefix
@@ -60,6 +94,14 @@ class KandeloFormulaSupportTest < Minitest::Test
     def shell_output(command, expected_status = 0)
       @command = command
       @expected_status = expected_status
+      config_assignment = Shellwords.shellsplit(command).find do |token|
+        token.start_with?("KANDELO_FORMULA_PTY_CONFIG_PATH=")
+      end
+      if config_assignment
+        @pty_config_path = Pathname(config_assignment.delete_prefix("KANDELO_FORMULA_PTY_CONFIG_PATH="))
+        @pty_config_mode = @pty_config_path.stat.mode & 0777
+        @pty_config = JSON.parse(@pty_config_path.read)
+      end
       shell_result || "runtime-ok\n"
     end
 
@@ -73,6 +115,7 @@ class KandeloFormulaSupportTest < Minitest::Test
       @system_calls ||= []
       @system_calls << args
       @system_args = args
+      @system_environment = ENV.to_hash
       if (output_index = args.index("-o"))
         File.binwrite(args.fetch(output_index + 1), "instrumented")
       end
@@ -101,14 +144,6 @@ class KandeloFormulaSupportTest < Minitest::Test
       File.binwrite(output_path, guest_output || "guest output\n")
       output
     end
-  end
-
-  def test_target_formula_identity_includes_calling_and_core_taps
-    harness = Harness.new
-
-    assert harness.kandelo_target_formula?("brandonpayton/kandelo-canary/m4")
-    assert harness.kandelo_target_formula?("kandelo-dev/tap-core/dash")
-    refute harness.kandelo_target_formula?("homebrew/core/dash")
   end
 
   # Executes Formula commands while retaining the embedding streams separately.
@@ -164,6 +199,213 @@ class KandeloFormulaSupportTest < Minitest::Test
     ENV.replace(original) if original
   end
 
+  def with_tier2_loader_fixture(tap_name: "kandelo-dev/tap-core")
+    Dir.mktmpdir("kandelo-tier2-loader") do |dir|
+      base = Pathname(dir).realpath
+      owner, short_tap = tap_name.split("/", 2)
+      tap_root = base/owner/"homebrew-#{short_tap}"
+      support_path = tap_root/"Kandelo/formula_support/kandelo_formula_support.rb"
+      formula_path = tap_root/"Formula/hello.rb"
+      prefix = base/"prefix"
+      root = base/"kandelo-root"
+      sysroot = root/"sysroot"
+      [support_path.dirname, formula_path.dirname, prefix, sysroot].each(&:mkpath)
+      FileUtils.cp(File.expand_path("../kandelo_formula_support.rb", __dir__), support_path)
+      formula_path.binwrite("class Hello < Formula\nend\n")
+      yield({
+        base:,
+        formula_path:,
+        prefix:,
+        root:,
+        support_path:,
+        sysroot:,
+        tap_name:,
+      })
+    end
+  end
+
+  def tier2_loader_attestation(fixture, bridge: true)
+    nested = if bridge
+      {
+        "build_toml_sha256"   => "b" * 64,
+        "package"             => "hello",
+        "package_toml_sha256" => "c" * 64,
+        "script"              => "build-hello.sh",
+        "script_env_keys"     => [],
+        "script_sha256"       => "d" * 64,
+        "source_mode"         => "exact",
+        "source_sha256"       => "e" * 64,
+        "source_url"          => "https://example.test/hello-1.0.tar.gz",
+        "version"             => "1.0",
+      }
+    end
+    {
+      "schema"            => 1,
+      "arch"              => "wasm32",
+      "tap"               => fixture.fetch(:tap_name),
+      "formula"           => "hello",
+      "full_name"         => "#{fixture.fetch(:tap_name)}/hello",
+      "formula_sha256"    => Digest::SHA256.file(fixture.fetch(:formula_path)).hexdigest,
+      "support_sha256"    => Digest::SHA256.file(fixture.fetch(:support_path)).hexdigest,
+      "tier2_bridge"      => nested,
+    }
+  end
+
+  def write_tier2_loader_attestation(fixture, contents)
+    path = fixture.fetch(:prefix)/KandeloFormulaSupport::KANDELO_TIER2_ATTESTATION_BASENAME
+    path.binwrite(contents)
+    path.chmod(0444)
+    path
+  end
+
+  def run_tier2_support_load(fixture, after_require, environment: {}, homebrew_filtered: false)
+    env = {
+      "HOMEBREW_PREFIX"                 => fixture.fetch(:prefix).to_s,
+      "HOMEBREW_KANDELO_ARCH"           => "wasm32",
+      "HOMEBREW_KANDELO_ROOT"           => fixture.fetch(:root).to_s,
+      "HOMEBREW_KANDELO_SYSROOT"        => fixture.fetch(:sysroot).to_s,
+      "KANDELO_HOMEBREW_ARCH"           => "wasm32",
+      "KANDELO_HOMEBREW_KANDELO_ROOT"   => fixture.fetch(:root).to_s,
+      "WASM_POSIX_SYSROOT"              => fixture.fetch(:sysroot).to_s,
+    }.merge(environment)
+    source = <<~RUBY
+      require #{fixture.fetch(:support_path).to_s.inspect}
+      #{after_require}
+    RUBY
+    if homebrew_filtered
+      # `bin/brew` rebuilds Formula evaluation's environment from a fixed
+      # allowlist plus every HOMEBREW_* value. None of this fixture's fixed
+      # allowlist values carry publisher authority, so retain only that prefix.
+      env = env.select { |key, _value| key.start_with?("HOMEBREW_") }
+      Open3.capture3(env, RbConfig.ruby, "-e", source, unsetenv_others: true)
+    else
+      Open3.capture3(env, RbConfig.ruby, "-e", source)
+    end
+  end
+
+  def with_tier2_build_fixture(script_env: nil, formula_name: "hello", package_name: formula_name)
+    original = ENV.to_hash
+    Dir.mktmpdir("kandelo-tier2-build") do |dir|
+      base = Pathname(dir).realpath
+      root = base/"kandelo-root"
+      registry_root = root/"packages/registry"
+      package_root = registry_root/package_name
+      sysroot = root/"sysroot"
+      build_path = base/"formula-build"
+      formula_path = base/"#{formula_name}.rb"
+      support_path = base/"kandelo_formula_support.rb"
+      [package_root, sysroot, build_path].each(&:mkpath)
+      package_toml = package_root/"package.toml"
+      build_toml = package_root/"build.toml"
+      script = package_root/"build-#{package_name}.sh"
+      package_toml.binwrite("name = #{package_name.inspect}\nversion = \"1.0\"\n")
+      build_toml.binwrite("script_path = \"packages/registry/#{package_name}/build-#{package_name}.sh\"\n")
+      script.binwrite("#!/usr/bin/env bash\nset -euo pipefail\n")
+      formula_path.binwrite("class #{formula_name.capitalize} < Formula\nend\n")
+      FileUtils.cp(File.expand_path("../kandelo_formula_support.rb", __dir__), support_path)
+      (build_path/"upstream.c").binwrite("int main(void) { return 0; }\n")
+      resource_dir = build_path/"kandelo-package-resources"
+      (resource_dir/"resource").mkpath
+      (resource_dir/"resource/input.txt").binwrite("verified resource\n")
+      script_env ||= {
+        "HELLO_RESOURCE"                    => resource_dir/"resource",
+        "WASM_POSIX_DEP_PKG_CONFIG_PATH"    => "/formula/pkgconfig",
+      }
+      bridge = {
+        "build_toml_sha256"   => Digest::SHA256.file(build_toml).hexdigest,
+        "package"             => package_name,
+        "package_toml_sha256" => Digest::SHA256.file(package_toml).hexdigest,
+        "script"              => "build-#{package_name}.sh",
+        "script_env_keys"     => script_env.keys.sort,
+        "script_sha256"       => Digest::SHA256.file(script).hexdigest,
+        "source_mode"         => "exact",
+        "source_sha256"       => "a" * 64,
+        "source_url"          => "https://example.test/hello-1.0.tar.gz",
+        "version"             => "1.0",
+      }
+      attestation = {
+        "schema"          => 1,
+        "arch"            => "wasm32",
+        "tap"             => "kandelo-dev/tap-core",
+        "formula"         => formula_name,
+        "full_name"       => "kandelo-dev/tap-core/#{formula_name}",
+        "formula_sha256"  => Digest::SHA256.file(formula_path).hexdigest,
+        "support_sha256"  => Digest::SHA256.file(support_path).hexdigest,
+        "tier2_bridge"    => bridge,
+      }
+      trusted_env = KandeloFormulaSupport::KANDELO_TIER2_TRUSTED_ENV_KEYS.to_h { |key| [key, nil] }
+      trusted_env.merge!({
+        "HOMEBREW_KANDELO_ARCH"         => "wasm32",
+        "HOMEBREW_KANDELO_ROOT"         => root.to_s,
+        "HOMEBREW_KANDELO_SYSROOT"      => sysroot.to_s,
+        "KANDELO_HOMEBREW_ARCH"         => "wasm32",
+        "KANDELO_HOMEBREW_KANDELO_ROOT" => root.to_s,
+        "WASM_POSIX_SYSROOT"            => sysroot.to_s,
+      })
+      runtime = {
+        "attestation"     => attestation,
+        "attestation_path" => (base/"attestation.json").to_s,
+        "formula_path"    => formula_path.to_s,
+        "support_path"    => support_path.to_s,
+        "support_sha256"  => attestation.fetch("support_sha256"),
+        "trusted_env"     => trusted_env,
+      }
+      activation_calls = []
+      harness = Harness.new
+      harness.build_path = build_path
+      harness.formula_name = formula_name
+      harness.formula_full_name = "kandelo-dev/tap-core/#{formula_name}"
+      harness.formula_path = formula_path
+      harness.formula_version = "1.0"
+      harness.root_path = root.to_s
+      harness.stable_spec = StableSpec.new(
+        url: bridge.fetch("source_url"),
+        checksum: StableChecksum.new(hexdigest: bridge.fetch("source_sha256")),
+      )
+      harness.tier2_runtime = runtime
+      harness.define_singleton_method(:kandelo_activate_sdk!) do
+        activation_calls << :sdk
+        ENV["WASM_POSIX_DEP_PKG_CONFIG_PATH"] = "/sdk/overwrote-formula-value"
+        root.to_s
+      end
+      harness.define_singleton_method(:kandelo_activate_sysroot!) do |activated_root|
+        activation_calls << :sysroot
+        raise "wrong activation root" unless activated_root == root.to_s
+
+        ENV["WASM_POSIX_SYSROOT"] = sysroot.to_s
+        activated_root
+      end
+
+      yield({
+        activation_calls:,
+        bridge:,
+        build_path:,
+        build_toml:,
+        formula_path:,
+        harness:,
+        package_toml:,
+        resource_dir:,
+        root:,
+        script:,
+        script_env:,
+        support_path:,
+      })
+    end
+  ensure
+    ENV.replace(original) if original
+  end
+
+  def assert_tier2_rejected_before_activation(fixture, script_env: fixture.fetch(:script_env))
+    error = assert_raises(RuntimeError) do
+      fixture.fetch(:harness).kandelo_build_package(script_env:)
+    end
+    assert_empty fixture.fetch(:activation_calls)
+    assert_nil fixture.fetch(:harness).system_calls
+    assert_path_exists fixture.fetch(:build_path)/"upstream.c"
+    refute_path_exists fixture.fetch(:build_path)/"kandelo-package-source"
+    error
+  end
+
   def test_node_execution_receipt_is_optional
     previous = ENV.delete("HOMEBREW_KANDELO_NODE_RECEIPT_PATH")
 
@@ -201,6 +443,514 @@ class KandeloFormulaSupportTest < Minitest::Test
 
     error = assert_raises(RuntimeError) { harness.formula_opt_prefix(target) }
     assert_includes error.message, "is not installed at /missing/Cellar/openssl/3.3.2_2"
+  end
+
+  def test_verified_formula_source_is_isolated_from_bridge_work_and_output_roots
+    Dir.mktmpdir("kandelo-formula-source") do |dir|
+      build_path = Pathname(dir)/"build"
+      (build_path/"src").mkpath
+      (build_path/"src/main.c").write("int main(void) { return 0; }\n")
+      (build_path/".upstream-marker").write("verified source\n")
+      harness = Harness.new
+      harness.build_path = build_path
+
+      source_dir = harness.kandelo_stage_verified_formula_source
+
+      assert_equal build_path/"kandelo-package-source", source_dir
+      assert_equal "int main(void) { return 0; }\n", (source_dir/"src/main.c").read
+      assert_equal "verified source\n", (source_dir/".upstream-marker").read
+      assert_equal [source_dir], build_path.children
+      refute_path_exists build_path/"kandelo-package-work"
+      refute_path_exists build_path/"kandelo-package-out"
+
+      error = assert_raises(RuntimeError) { harness.kandelo_stage_verified_formula_source }
+      assert_includes error.message, "Formula source was already staged"
+    end
+  end
+
+  def test_verified_formula_source_rejects_an_empty_buildpath
+    Dir.mktmpdir("kandelo-empty-formula-source") do |dir|
+      harness = Harness.new
+      harness.build_path = Pathname(dir)
+
+      error = assert_raises(RuntimeError) { harness.kandelo_stage_verified_formula_source }
+      assert_includes error.message, "did not stage Formula source"
+    end
+  end
+
+  def test_support_load_succeeds_without_a_publisher_attestation
+    with_tier2_loader_fixture do |fixture|
+      marker = fixture.fetch(:base)/"formula-evaluated"
+      _stdout, stderr, status = run_tier2_support_load(
+        fixture, "File.binwrite(#{marker.to_s.inspect}, \"evaluated\\n\")"
+      )
+
+      assert status.success?, stderr
+      assert_equal "evaluated\n", marker.binread
+    end
+  end
+
+  def test_support_load_validates_and_recursively_freezes_an_active_attestation
+    with_tier2_loader_fixture do |fixture|
+      document = tier2_loader_attestation(fixture)
+      write_tier2_loader_attestation(fixture, JSON.generate(document))
+      assertion = <<~'RUBY'
+        runtime = KandeloFormulaSupport::KANDELO_TIER2_RUNTIME
+        values = [runtime, runtime["attestation"], runtime["attestation"]["tier2_bridge"],
+                  runtime["attestation"]["tier2_bridge"]["script_env_keys"],
+                  runtime["attestation"]["tier2_bridge"]["source_url"],
+                  runtime["trusted_env"]]
+        abort "runtime authority is not recursively frozen" unless values.all?(&:frozen?)
+        puts runtime["attestation"]["full_name"]
+      RUBY
+      stdout, stderr, status = run_tier2_support_load(fixture, assertion)
+
+      assert status.success?, stderr
+      assert_equal "kandelo-dev/tap-core/hello\n", stdout
+    end
+  end
+
+  def test_target_formula_identity_prefers_the_path_bound_attested_tap
+    with_tier2_loader_fixture(tap_name: "brandonpayton/kandelo-canary") do |fixture|
+      document = tier2_loader_attestation(fixture)
+      write_tier2_loader_attestation(fixture, JSON.generate(document))
+      assertion = <<~'RUBY'
+        harness = Class.new do
+          include KandeloFormulaSupport
+
+          def full_name
+            "wrong/tap/formula"
+          end
+
+          def odie(message)
+            raise message
+          end
+        end.new
+        abort "attested primary tap was not selected" unless
+          harness.kandelo_target_formula?("brandonpayton/kandelo-canary/helper")
+        abort "canonical core tap was not selected" unless
+          harness.kandelo_target_formula?("kandelo-dev/tap-core/dash")
+        abort "unattested foreign tap was selected" if
+          harness.kandelo_target_formula?("wrong/tap/helper")
+      RUBY
+      _stdout, stderr, status = run_tier2_support_load(fixture, assertion)
+
+      assert status.success?, stderr
+    end
+  end
+
+  def test_support_load_accepts_a_distinct_valid_registry_package_identity
+    with_tier2_loader_fixture do |fixture|
+      document = tier2_loader_attestation(fixture)
+      document.fetch("tier2_bridge")["package"] = "cpython"
+      write_tier2_loader_attestation(fixture, JSON.generate(document))
+      assertion = <<~'RUBY'
+        runtime = KandeloFormulaSupport::KANDELO_TIER2_RUNTIME
+        abort "Formula identity changed" unless runtime.dig("attestation", "formula") == "hello"
+        abort "registry package mapping changed" unless
+          runtime.dig("attestation", "tier2_bridge", "package") == "cpython"
+      RUBY
+      _stdout, stderr, status = run_tier2_support_load(fixture, assertion)
+
+      assert status.success?, stderr
+    end
+  end
+
+  def test_support_load_accepts_homebrew_filtered_aliases_and_synthesizes_compatibility_values
+    with_tier2_loader_fixture do |fixture|
+      document = tier2_loader_attestation(fixture)
+      write_tier2_loader_attestation(fixture, JSON.generate(document))
+      assertion = <<~'RUBY'
+        trusted = KandeloFormulaSupport::KANDELO_TIER2_RUNTIME.fetch("trusted_env")
+        expected_root = ENV.fetch("HOMEBREW_KANDELO_ROOT")
+        expected_arch = ENV.fetch("HOMEBREW_KANDELO_ARCH")
+        expected_sysroot = ENV.fetch("HOMEBREW_KANDELO_SYSROOT")
+        abort "authoritative root changed" unless trusted.fetch("HOMEBREW_KANDELO_ROOT") == expected_root
+        abort "authoritative arch changed" unless trusted.fetch("HOMEBREW_KANDELO_ARCH") == expected_arch
+        abort "authoritative sysroot changed" unless
+          trusted.fetch("HOMEBREW_KANDELO_SYSROOT") == expected_sysroot
+        abort "filtered root alias was not synthesized" unless
+          trusted.fetch("KANDELO_HOMEBREW_KANDELO_ROOT") == expected_root
+        abort "filtered arch alias was not synthesized" unless
+          trusted.fetch("KANDELO_HOMEBREW_ARCH") == expected_arch
+        abort "filtered sysroot alias was not synthesized" unless
+          trusted.fetch("WASM_POSIX_SYSROOT") == expected_sysroot
+      RUBY
+      _stdout, stderr, status = run_tier2_support_load(
+        fixture,
+        assertion,
+        homebrew_filtered: true,
+      )
+
+      assert status.success?, stderr
+    end
+  end
+
+  def test_support_load_rejects_missing_authority_and_conflicting_legacy_aliases
+    with_tier2_loader_fixture do |fixture|
+      document = tier2_loader_attestation(fixture)
+      write_tier2_loader_attestation(fixture, JSON.generate(document))
+      mutations = {
+        "missing authoritative root" => [
+          { "HOMEBREW_KANDELO_ROOT" => nil },
+          "publisher root or architecture environment is inconsistent",
+        ],
+        "missing authoritative arch" => [
+          { "HOMEBREW_KANDELO_ARCH" => nil },
+          "publisher root or architecture environment is inconsistent",
+        ],
+        "conflicting root alias" => [
+          { "KANDELO_HOMEBREW_KANDELO_ROOT" => fixture.fetch(:base).to_s },
+          "publisher root or architecture environment is inconsistent",
+        ],
+        "conflicting arch alias" => [
+          { "KANDELO_HOMEBREW_ARCH" => "wasm64" },
+          "publisher root or architecture environment is inconsistent",
+        ],
+        "conflicting sysroot alias" => [
+          { "WASM_POSIX_SYSROOT" => fixture.fetch(:root).to_s },
+          "publisher sysroot environment is inconsistent",
+        ],
+      }
+      mutations.each do |label, mutation|
+        environment, error_fragment = mutation
+        marker = fixture.fetch(:base)/"#{label.tr(" ", "-")}-evaluated"
+        _stdout, stderr, status = run_tier2_support_load(
+          fixture,
+          "File.binwrite(#{marker.to_s.inspect}, \"evaluated\\n\")",
+          environment:,
+        )
+
+        refute status.success?, label
+        assert_includes stderr, error_fragment, label
+        refute_path_exists marker, label
+      end
+    end
+  end
+
+  def test_null_attestation_loads_but_cannot_authorize_the_tier2_helper
+    with_tier2_loader_fixture do |fixture|
+      document = tier2_loader_attestation(fixture, bridge: false)
+      write_tier2_loader_attestation(fixture, JSON.generate(document))
+      assertion = <<~'RUBY'
+        harness = Class.new do
+          include KandeloFormulaSupport
+          def odie(message)
+            raise message
+          end
+        end.new
+        begin
+          harness.kandelo_build_package(script_env: {})
+          abort "null Tier-2 authority unexpectedly built"
+        rescue RuntimeError => error
+          abort error.message unless error.message.include?("require a valid publisher attestation")
+        end
+      RUBY
+      _stdout, stderr, status = run_tier2_support_load(fixture, assertion)
+
+      assert status.success?, stderr
+    end
+  end
+
+  def test_invalid_attestations_abort_before_formula_evaluation
+    with_tier2_loader_fixture do |fixture|
+      valid = tier2_loader_attestation(fixture)
+      valid_json = JSON.generate(valid)
+      missing_top = valid.dup
+      missing_top.delete("formula_sha256")
+      missing_bridge = JSON.parse(valid_json)
+      missing_bridge.fetch("tier2_bridge").delete("script_sha256")
+      unknown_bridge = JSON.parse(valid_json)
+      unknown_bridge.fetch("tier2_bridge")["unknown"] = true
+      invalid_bridge_type = JSON.parse(valid_json)
+      invalid_bridge_type.fetch("tier2_bridge")["script_env_keys"] = "HELLO_VALUE"
+      invalid_bridge_package = JSON.parse(valid_json)
+      invalid_bridge_package.fetch("tier2_bridge")["package"] = "../hello"
+      mutations = {
+        "duplicate key"       => valid_json.sub('"schema":1', '"schema":1,"schema":1'),
+        "missing top key"     => JSON.generate(missing_top),
+        "unknown top key"     => JSON.generate(valid.merge("unknown" => true)),
+        "missing bridge key"  => JSON.generate(missing_bridge),
+        "unknown bridge key"  => JSON.generate(unknown_bridge),
+        "bridge value type"   => JSON.generate(invalid_bridge_type),
+        "bridge package"      => JSON.generate(invalid_bridge_package),
+        "schema"              => JSON.generate(valid.merge("schema" => 2)),
+        "formula hash"        => JSON.generate(valid.merge("formula_sha256" => "f" * 64)),
+        "support hash"        => JSON.generate(valid.merge("support_sha256" => "f" * 64)),
+        "trailing JSON value" => "#{valid_json} true",
+      }
+      mutations.each do |label, contents|
+        marker = fixture.fetch(:base)/"#{label.tr(" ", "-")}-evaluated"
+        path = write_tier2_loader_attestation(fixture, contents)
+        _stdout, _stderr, status = run_tier2_support_load(
+          fixture, "File.binwrite(#{marker.to_s.inspect}, \"evaluated\\n\")"
+        )
+
+        refute status.success?, label
+        refute_path_exists marker, label
+        path.chmod(0644)
+      end
+    end
+  end
+
+  def test_attestation_file_mode_and_identity_abort_before_formula_evaluation
+    with_tier2_loader_fixture do |fixture|
+      contents = JSON.generate(tier2_loader_attestation(fixture))
+      path = write_tier2_loader_attestation(fixture, contents)
+      path.chmod(0644)
+      mode_marker = fixture.fetch(:base)/"mode-evaluated"
+
+      _stdout, _stderr, status = run_tier2_support_load(
+        fixture, "File.binwrite(#{mode_marker.to_s.inspect}, \"evaluated\\n\")"
+      )
+
+      refute status.success?
+      refute_path_exists mode_marker
+
+      path.delete
+      target = fixture.fetch(:base)/"attestation-target.json"
+      target.binwrite(contents)
+      target.chmod(0444)
+      path.make_symlink(target)
+      symlink_marker = fixture.fetch(:base)/"symlink-evaluated"
+
+      _stdout, _stderr, status = run_tier2_support_load(
+        fixture, "File.binwrite(#{symlink_marker.to_s.inspect}, \"evaluated\\n\")"
+      )
+
+      refute status.success?
+      refute_path_exists symlink_marker
+    end
+  end
+
+  def test_absent_runtime_authority_rejects_before_sdk_activation_or_process_execution
+    harness = Harness.new
+    activated = false
+    harness.define_singleton_method(:kandelo_activate_sdk!) do
+      activated = true
+      "/tmp/kandelo"
+    end
+
+    error = assert_raises(RuntimeError) { harness.kandelo_build_package(script_env: {}) }
+
+    assert_includes error.message, "require a valid publisher attestation"
+    refute activated
+    assert_nil harness.system_calls
+  end
+
+  def test_tier2_helper_executes_the_exact_attested_script_with_authoritative_environment
+    with_tier2_build_fixture do |fixture|
+      ENV["HELLO_RESOURCE"] = "/ambient/resource"
+      ENV["WASM_POSIX_BINARY_INDEX_URL"] = "https://ambient.invalid/index.toml"
+      ENV["WASM_POSIX_DEFAULT_ARCH"] = "wasm64"
+      ENV["WASM_POSIX_DEP_NAME"] = "ambient-name"
+      ENV["WASM_POSIX_INSTALL_LOCAL_MIRROR"] = "1"
+      ENV["HELLO_AMBIENT"] = "must-be-removed"
+
+      out_dir = fixture.fetch(:harness).kandelo_build_package(
+        script_env: fixture.fetch(:script_env)
+      )
+
+      assert_equal fixture.fetch(:build_path)/"kandelo-package-out", out_dir
+      assert_equal [:sdk, :sysroot], fixture.fetch(:activation_calls)
+      assert_equal ["/usr/bin/bash", fixture.fetch(:script).to_s], fixture.fetch(:harness).system_args
+      environment = fixture.fetch(:harness).system_environment
+      assert_equal fixture.fetch(:resource_dir).join("resource").to_s, environment.fetch("HELLO_RESOURCE")
+      assert_equal "/formula/pkgconfig", environment.fetch("WASM_POSIX_DEP_PKG_CONFIG_PATH")
+      assert_equal "hello", environment.fetch("WASM_POSIX_DEP_NAME")
+      assert_equal "1.0", environment.fetch("WASM_POSIX_DEP_VERSION")
+      assert_equal "wasm32", environment.fetch("WASM_POSIX_DEP_TARGET_ARCH")
+      assert_equal "0", environment.fetch("WASM_POSIX_INSTALL_LOCAL_MIRROR")
+      assert_equal fixture.fetch(:root).to_s, environment.fetch("HOMEBREW_KANDELO_ROOT")
+      refute environment.key?("WASM_POSIX_BINARY_INDEX_URL")
+      refute environment.key?("WASM_POSIX_DEFAULT_ARCH")
+      refute environment.key?("HELLO_AMBIENT")
+      assert_path_exists fixture.fetch(:resource_dir)/"resource/input.txt"
+      assert_path_exists fixture.fetch(:build_path)/"kandelo-package-source/upstream.c"
+    end
+  end
+
+  def test_tier2_helper_executes_an_explicit_attested_registry_package_mapping
+    script_env = { "WASM_POSIX_DEP_PKG_CONFIG_PATH" => "/formula/pkgconfig" }
+    with_tier2_build_fixture(
+      formula_name: "python", package_name: "cpython", script_env:
+    ) do |fixture|
+      out_dir = fixture.fetch(:harness).kandelo_build_package(
+        package: "cpython", script_env: fixture.fetch(:script_env)
+      )
+
+      assert_equal fixture.fetch(:build_path)/"kandelo-package-out", out_dir
+      assert_equal [:sdk, :sysroot], fixture.fetch(:activation_calls)
+      assert_equal ["/usr/bin/bash", fixture.fetch(:script).to_s], fixture.fetch(:harness).system_args
+      assert_equal "cpython", fixture.fetch(:harness).system_environment.fetch("WASM_POSIX_DEP_NAME")
+      assert_path_exists fixture.fetch(:build_path)/"kandelo-package-source/upstream.c"
+    end
+  end
+
+  def test_tier2_helper_rejects_unattested_registry_package_mappings_before_activation
+    script_env = { "WASM_POSIX_DEP_PKG_CONFIG_PATH" => "/formula/pkgconfig" }
+    with_tier2_build_fixture(
+      formula_name: "python", package_name: "cpython", script_env:
+    ) do |fixture|
+      attempts = {
+        "omitted mapping"  => -> { fixture.fetch(:harness).kandelo_build_package(script_env:) },
+        "wrong mapping"    => lambda do
+          fixture.fetch(:harness).kandelo_build_package(package: "python", script_env:)
+        end,
+        "non-string mapping" => lambda do
+          fixture.fetch(:harness).kandelo_build_package(package: 1, script_env:)
+        end,
+      }
+      attempts.each do |label, attempt|
+        error = assert_raises(RuntimeError, label, &attempt)
+        assert_includes error.message, "registry package differs", label
+        assert_empty fixture.fetch(:activation_calls), label
+        assert_nil fixture.fetch(:harness).system_calls, label
+        assert_path_exists fixture.fetch(:build_path)/"upstream.c", label
+        refute_path_exists fixture.fetch(:build_path)/"kandelo-package-source", label
+      end
+    end
+  end
+
+  def test_tier2_helper_rejects_every_formula_identity_mismatch_before_activation
+    mutations = {
+      "name" => lambda do |fixture|
+        fixture.fetch(:harness).formula_name = "other"
+      end,
+      "full name" => lambda do |fixture|
+        fixture.fetch(:harness).formula_full_name = "other/tap/hello"
+      end,
+      "version" => lambda do |fixture|
+        fixture.fetch(:harness).formula_version = "367"
+      end,
+      "source URL" => lambda do |fixture|
+        fixture.fetch(:harness).stable_spec = StableSpec.new(
+          url: "https://example.test/other.tar.gz",
+          checksum: StableChecksum.new(hexdigest: fixture.fetch(:bridge).fetch("source_sha256")),
+        )
+      end,
+      "source checksum" => lambda do |fixture|
+        fixture.fetch(:harness).stable_spec = StableSpec.new(
+          url: fixture.fetch(:bridge).fetch("source_url"),
+          checksum: StableChecksum.new(hexdigest: "f" * 64),
+        )
+      end,
+      "path" => lambda do |fixture|
+        other = fixture.fetch(:build_path).parent/"other.rb"
+        other.binwrite(fixture.fetch(:formula_path).binread)
+        fixture.fetch(:harness).formula_path = other
+      end,
+    }
+    mutations.each do |label, mutate|
+      with_tier2_build_fixture do |fixture|
+        mutate.call(fixture)
+        error = assert_tier2_rejected_before_activation(fixture)
+        assert_match(/Formula (?:identity|path) differs/, error.message, label)
+      end
+    end
+  end
+
+  def test_tier2_helper_rejects_formula_support_and_registry_hash_drift_before_activation
+    paths = {
+      "Formula"               => :formula_path,
+      "Formula support"       => :support_path,
+      "registry package.toml" => :package_toml,
+      "registry build.toml"   => :build_toml,
+      "registry build script" => :script,
+    }
+    paths.each do |label, key|
+      with_tier2_build_fixture do |fixture|
+        fixture.fetch(key).open("ab") { |file| file.write("# drift\n") }
+        error = assert_tier2_rejected_before_activation(fixture)
+        assert_includes error.message, label
+      end
+    end
+  end
+
+  def test_tier2_helper_rechecks_the_script_immediately_before_execution
+    with_tier2_build_fixture do |fixture|
+      harness = fixture.fetch(:harness)
+      root = fixture.fetch(:root)
+      sysroot = root/"sysroot"
+      script = fixture.fetch(:script)
+      harness.define_singleton_method(:kandelo_activate_sysroot!) do |activated_root|
+        fixture.fetch(:activation_calls) << :sysroot
+        ENV["WASM_POSIX_SYSROOT"] = sysroot.to_s
+        script.open("ab") { |file| file.write("# late drift\n") }
+        activated_root
+      end
+
+      error = assert_raises(RuntimeError) do
+        harness.kandelo_build_package(script_env: fixture.fetch(:script_env))
+      end
+
+      assert_includes error.message, "registry build script differs"
+      assert_equal [:sdk, :sysroot], fixture.fetch(:activation_calls)
+      assert_nil harness.system_calls
+    end
+  end
+
+  def test_tier2_helper_rejects_script_env_shape_and_value_boundaries_before_activation
+    cases = {
+      "exact keys" => ->(env) { env.reject { |key, _value| key == "HELLO_RESOURCE" } },
+      "key type"   => ->(env) { env.merge(1 => "bad") },
+      "value type" => ->(env) { env.merge("HELLO_RESOURCE" => 1) },
+      "NUL"        => ->(env) { env.merge("HELLO_RESOURCE" => "bad\0value") },
+      "value size" => ->(env) { env.merge("HELLO_RESOURCE" => "x" * 4_097) },
+    }
+    cases.each do |label, mutate|
+      with_tier2_build_fixture do |fixture|
+        error = assert_tier2_rejected_before_activation(
+          fixture, script_env: mutate.call(fixture.fetch(:script_env))
+        )
+        assert_match(/script_env/, error.message, label)
+      end
+    end
+
+    aggregate_env = (0...5).to_h { |index| ["HELLO_VALUE_#{index}", "x" * 4_096] }
+    with_tier2_build_fixture(script_env: aggregate_env) do |fixture|
+      error = assert_tier2_rejected_before_activation(fixture)
+      assert_includes error.message, "differs from the publisher attestation"
+    end
+
+    {
+      "reserved"  => { "WASM_POSIX_DEP_NAME" => "hello" },
+      "namespace" => { "UNRELATED_VALUE" => "hello" },
+    }.each do |label, env|
+      with_tier2_build_fixture(script_env: env) do |fixture|
+        error = assert_tier2_rejected_before_activation(fixture)
+        assert_match(/(?:helper-owned|approved namespace)/, error.message, label)
+      end
+    end
+  end
+
+  def test_tier2_helper_rejects_stale_and_symlinked_build_roots_before_activation
+    mutations = {
+      "source" => lambda do |fixture|
+        (fixture.fetch(:build_path)/"kandelo-package-source").mkpath
+      end,
+      "work" => lambda do |fixture|
+        (fixture.fetch(:build_path)/"kandelo-package-work").make_symlink(fixture.fetch(:root))
+      end,
+      "out" => lambda do |fixture|
+        (fixture.fetch(:build_path)/"kandelo-package-out").binwrite("stale\n")
+      end,
+      "resource" => lambda do |fixture|
+        FileUtils.rm_rf(fixture.fetch(:resource_dir))
+        fixture.fetch(:resource_dir).make_symlink(fixture.fetch(:root))
+      end,
+    }
+    mutations.each do |label, mutate|
+      with_tier2_build_fixture do |fixture|
+        mutate.call(fixture)
+        error = assert_raises(RuntimeError) do
+          fixture.fetch(:harness).kandelo_build_package(script_env: fixture.fetch(:script_env))
+        end
+        assert_empty fixture.fetch(:activation_calls)
+        assert_nil fixture.fetch(:harness).system_calls
+        assert_match(/(?:build root|resource root|already staged)/, error.message, label)
+      end
+    end
   end
 
   def test_sdk_activation_declares_exact_direct_and_transitive_target_pkg_config_dirs
@@ -297,6 +1047,31 @@ class KandeloFormulaSupportTest < Minitest::Test
       assert_equal [wasm.to_s, "-o", "#{wasm}.fork-instrumented"], harness.system_args.drop(1)
       refute File.exist?("#{wasm}.fork-instrumented")
     end
+  end
+
+  def test_texlive_build_runner_uses_the_bound_support_child_and_escaped_arguments
+    harness = Harness.new
+    harness.define_singleton_method(:kandelo_host_tool) { |name| "/host tools/#{name}" }
+
+    harness.kandelo_run_texlive_pdftex("engine", "/source tree", "$(false)")
+
+    expected_runner = Pathname(__dir__).parent/"build-texlive-pdftex.sh"
+    assert_equal ["/host tools/bash", "-c"], harness.system_args.first(2)
+    assert_equal ["/host tools/bash", expected_runner.to_s, "engine", "/source tree", "$(false)"],
+                 Shellwords.shellsplit(harness.system_args.fetch(2))
+  end
+
+  def test_texlive_config_runner_uses_the_bound_support_child_and_module_root
+    harness = Harness.new
+    harness.define_singleton_method(:kandelo_host_tool) { |name| "/host tools/#{name}" }
+
+    harness.kandelo_generate_texlive_runtime_config("/module root", "/runtime root", "selected packages")
+
+    expected_runner = Pathname(__dir__).parent/"generate-texlive-runtime-config.pl"
+    assert_equal ["/host tools/bash", "-c"], harness.system_args.first(2)
+    assert_equal [
+      "/host tools/perl", "-I/module root", expected_runner.to_s, "/runtime root", "selected packages"
+    ], Shellwords.shellsplit(harness.system_args.fetch(2))
   end
 
   def test_artifact_validation_requires_abi_asyncify_and_fork_guards
@@ -494,10 +1269,10 @@ class KandeloFormulaSupportTest < Minitest::Test
         opt_libexec: Pathname("/prefix/opt/coreutils/libexec"),
       ),
       DependencyFormula.new(
-        full_name:   "wabt",
-        opt_bin:     Pathname("/prefix/opt/wabt/bin"),
-        opt_sbin:    Pathname("/prefix/opt/wabt/sbin"),
-        opt_libexec: Pathname("/prefix/opt/wabt/libexec"),
+        full_name:   "rust",
+        opt_bin:     Pathname("/prefix/opt/rust/bin"),
+        opt_sbin:    Pathname("/prefix/opt/rust/sbin"),
+        opt_libexec: Pathname("/prefix/opt/rust/libexec"),
       ),
     ]
     original = ENV.to_hash
@@ -507,7 +1282,7 @@ class KandeloFormulaSupportTest < Minitest::Test
       "/prefix/opt/coreutils/bin",
       "/prefix/opt/coreutils/sbin",
       "/prefix/opt/coreutils/libexec/bin",
-      "/prefix/opt/wabt/bin",
+      "/prefix/opt/rust/bin",
       "/usr/bin",
     ].join(File::PATH_SEPARATOR)
 
@@ -519,10 +1294,40 @@ class KandeloFormulaSupportTest < Minitest::Test
     refute_includes build_path, "/prefix/opt/coreutils/bin"
     refute_includes build_path, "/prefix/opt/coreutils/sbin"
     refute_includes build_path, "/prefix/opt/coreutils/libexec/bin"
-    assert_includes build_path, "/prefix/opt/wabt/bin"
+    assert_includes build_path, "/prefix/opt/rust/bin"
     assert_includes build_path, "/usr/bin"
   ensure
     ENV.replace(original) if original
+  end
+
+  def test_canary_m4_loads_local_support_and_uses_the_locked_core_dependency
+    formula = File.read(File.expand_path("../../../Formula/m4.rb", __dir__))
+    support_require = 'require (Tap.fetch("brandonpayton", "kandelo-canary").path/' \
+                      '"Kandelo/formula_support/kandelo_formula_support").to_s'
+
+    assert_includes formula.lines, "#{support_require}\n"
+    assert_includes formula, %(  depends_on "kandelo-dev/tap-core/dash"\n)
+  end
+
+  def test_target_formula_identity_includes_the_primary_and_core_taps
+    harness = Harness.new
+    harness.formula_full_name = "brandonpayton/kandelo-canary/m4"
+    primary = DependencyFormula.new(full_name: "brandonpayton/kandelo-canary/helper")
+    core = DependencyFormula.new(full_name: "kandelo-dev/tap-core/dash")
+    native = DependencyFormula.new(full_name: "homebrew/core/pkgconf")
+    harness.runtime_formulae = [primary, core, native]
+
+    assert_equal [primary, core], harness.kandelo_target_runtime_dependencies
+  end
+
+  def test_target_formula_identity_fails_when_the_primary_tap_is_ambiguous
+    harness = Harness.new
+    harness.formula_full_name = "m4"
+
+    error = assert_raises(RuntimeError) do
+      harness.kandelo_target_formula?("brandonpayton/kandelo-canary/helper")
+    end
+    assert_equal "Kandelo Formula support cannot resolve the primary tap identity", error.message
   end
 
   def test_sdk_activation_cannot_reintroduce_the_global_homebrew_path
@@ -936,18 +1741,70 @@ class KandeloFormulaSupportTest < Minitest::Test
   end
 
   def test_execution_accepts_explicit_guest_files
-    harness = Harness.new
+    Dir.mktmpdir("kandelo-formula-guest-files") do |dir|
+      harness = Harness.new
+      harness.test_path = Pathname(dir)/"formula test"
+      harness.test_path.mkpath
+      guest_files = { "/etc/service.conf" => "/formula/service.conf" }
 
-    harness.kandelo_run_wasm(
-      "program.wasm",
-      [],
-      guest_files: { "/etc/service.conf" => "/formula/service.conf" },
-    )
+      harness.kandelo_run_wasm("program.wasm", [], guest_files:)
 
-    assert_includes harness.command, "run-network-wasm.ts"
-    assert_includes harness.command, "KANDELO_FORMULA_GUEST_FILES_JSON="
-    assert_includes harness.command, "/etc/service.conf"
-    assert_includes harness.command, "/formula/service.conf"
+      assert_includes harness.command, "run-network-wasm.ts"
+      assignment = Shellwords.shellsplit(harness.command).find do |token|
+        token.start_with?("KANDELO_FORMULA_GUEST_FILES_MANIFEST=")
+      end
+      refute_nil assignment
+      manifest = Pathname(assignment.delete_prefix("KANDELO_FORMULA_GUEST_FILES_MANIFEST="))
+      assert_equal guest_files, JSON.parse(manifest.read)
+      refute_includes harness.command, "KANDELO_FORMULA_GUEST_FILES_JSON="
+      refute_includes harness.command, "/etc/service.conf"
+      refute_includes harness.command, "/formula/service.conf"
+    end
+  end
+
+  def test_execution_keeps_large_guest_file_maps_out_of_argv_and_environment
+    original = ENV.to_hash
+    Dir.mktmpdir("kandelo-formula-large-guest-files") do |dir|
+      root = Pathname(dir)/"kandelo root"
+      fake_bin = Pathname(dir)/"fake bin"
+      root.mkpath
+      fake_bin.mkpath
+      fake_node = fake_bin/"node"
+      fake_node.binwrite <<~SH
+        #!/bin/sh
+        set -eu
+        test -f "$KANDELO_FORMULA_GUEST_FILES_MANIFEST"
+        printf 'manifest-ok\n'
+      SH
+      fake_node.chmod(0755)
+      ENV["PATH"] = [fake_bin, ENV.fetch("PATH")].join(File::PATH_SEPARATOR)
+      ENV.delete("HOMEBREW_KANDELO_NODE")
+
+      harness = RuntimeHarness.new
+      harness.root_path = root.to_s
+      harness.test_path = Pathname(dir)/"formula test"
+      harness.test_path.mkpath
+      guest_files = 2_085.times.to_h do |index|
+        name = "runtime-#{format("%04d", index)}-#{"x" * 48}.vim"
+        ["/opt/vim/share/vim/vim92/#{name}", "/formula/vim/runtime/#{name}"]
+      end
+
+      output = harness.kandelo_run_wasm("program.wasm", [], guest_files:)
+
+      assert_equal "manifest-ok\n", output
+      assignment = Shellwords.shellsplit(harness.command).find do |token|
+        token.start_with?("KANDELO_FORMULA_GUEST_FILES_MANIFEST=")
+      end
+      refute_nil assignment
+      manifest = Pathname(assignment.delete_prefix("KANDELO_FORMULA_GUEST_FILES_MANIFEST="))
+      assert_equal guest_files, JSON.parse(manifest.read)
+      assert_operator manifest.size, :>, 131_072
+      assert_operator harness.command.bytesize, :<, 2_048
+      refute_includes harness.command, guest_files.keys.last
+      refute_includes harness.command, guest_files.values.last
+    end
+  ensure
+    ENV.replace(original) if original
   end
 
   def test_execution_accepts_guest_argv0_and_writable_host_directory
@@ -1115,7 +1972,7 @@ class KandeloFormulaSupportTest < Minitest::Test
   def test_browser_execution_accepts_expected_nonzero_status_and_merged_stderr
     Dir.mktmpdir("kandelo-formula-support") do |dir|
       harness = Harness.new
-      harness.root_path = Pathname(dir)/"kandelo root"
+      harness.root_path = (Pathname(dir)/"kandelo root").to_s
       harness.test_path = Pathname(dir)/"formula test"
       harness.test_path.mkpath
       command = Pathname(dir)/"getconf"
@@ -1185,44 +2042,94 @@ class KandeloFormulaSupportTest < Minitest::Test
 
       harness = Harness.new
       harness.root_path = root.to_s
+      harness.test_path = Pathname(dir)/"formula test"
+      harness.test_path.mkpath
       output = harness.kandelo_run_pty_wasm(
         "program.wasm", ["note.txt"],
         argv0:                      "/home/linuxbrew/.linuxbrew/opt/program/bin/program",
         env:                        { "KERNEL_CWD" => "/tmp/formula test" },
         inputs:                     ["\u001c", "beta", "\r"],
+        input_ready_text:           "editor ready",
         rerun_inputs:               ["\u0018"],
         exec_programs:              { "/opt/program/bin/helper" => "/formula/helper" },
         guest_files:                { "/etc/program.conf" => "/formula/program.conf" },
         guest_directories:          ["/home/linuxbrew/.linuxbrew/var/program/save"],
         writable_guest_directories: ["/home/linuxbrew/.linuxbrew/var/program"],
         writable_host_directories:  { "/work" => "/formula/test output" },
-        expected_fork_descendants:  2
+        expected_fork_descendants:  2,
+        timeout_ms:                 120_000,
+        completion_output:          "ready now"
       )
 
       assert_equal "runtime-ok\n", output
       assert_includes harness.command, "run-pty-wasm.ts"
-      assert_includes harness.command, "KANDELO_FORMULA_PTY_CONFIG_JSON="
-      assert_includes harness.command, "/home/linuxbrew/.linuxbrew/opt/program/bin/program"
+      refute_includes harness.command, "KANDELO_FORMULA_PTY_CONFIG_JSON="
+      assert_includes harness.command, "KANDELO_FORMULA_PTY_CONFIG_PATH="
       assert_includes harness.command, "note.txt"
-      assert_includes harness.command, "beta"
-      assert_includes harness.command, "rerunInputs"
-      assert_includes harness.command, "/opt/program/bin/helper"
-      assert_includes harness.command, "/formula/helper"
-      assert_includes harness.command, "/etc/program.conf"
-      assert_includes harness.command, "/home/linuxbrew/.linuxbrew/var/program"
-      assert_includes harness.command, "writableGuestDirectories"
-      assert_includes harness.command, "writableHostDirectories"
-      assert_includes harness.command, "/work"
-      assert_includes harness.command, "/formula/test\\ output"
       assert_includes harness.command, "program.wasm"
-      config_assignment = Shellwords.shellsplit(harness.command).find do |token|
-        token.start_with?("KANDELO_FORMULA_PTY_CONFIG_JSON=")
-      end
-      refute_nil config_assignment
-      config = JSON.parse(config_assignment.delete_prefix("KANDELO_FORMULA_PTY_CONFIG_JSON="))
+      config = harness.pty_config
+      assert_equal 0600, harness.pty_config_mode
+      refute_path_exists harness.pty_config_path
+      assert_equal "/home/linuxbrew/.linuxbrew/opt/program/bin/program", config.fetch("argv0")
+      assert_equal ["\u001c", "beta", "\r"], config.fetch("inputs")
+      assert_equal "editor ready", config.fetch("inputReadyText")
+      assert_equal ["\u0018"], config.fetch("rerunInputs")
+      assert_equal({ "/opt/program/bin/helper" => "/formula/helper" }, config.fetch("execPrograms"))
+      assert_equal({ "/etc/program.conf" => "/formula/program.conf" }, config.fetch("guestFiles"))
+      assert_equal(
+        ["/home/linuxbrew/.linuxbrew/var/program"],
+        config.fetch("writableGuestDirectories"),
+      )
+      assert_equal({ "/work" => "/formula/test output" }, config.fetch("writableHostDirectories"))
       assert_equal 2, config.fetch("expectedForkDescendants")
+      assert_equal 120_000, config.fetch("timeoutMs")
+      assert_equal "ready now", config.fetch("completionOutput")
       assert_equal "kandelo_run_pty_wasm", harness.recorded_launcher
       refute_path_exists host_dist
+    end
+  end
+
+  def test_pty_execution_keeps_large_runtime_maps_out_of_the_process_environment
+    Dir.mktmpdir("kandelo-formula-support") do |dir|
+      harness = Harness.new
+      harness.root_path = (Pathname(dir)/"kandelo root").to_s
+      harness.test_path = Pathname(dir)/"formula test"
+      harness.test_path.mkpath
+      guest_files = (0...4_000).to_h do |index|
+        ["/usr/share/vim/runtime/file-#{index}", "/host/vim/runtime/file-#{index}"]
+      end
+
+      harness.kandelo_run_pty_wasm("program.wasm", [], inputs: [":wq\r"], guest_files:)
+
+      config_bytes = JSON.generate(harness.pty_config).bytesize
+      assert_operator config_bytes, :>, 128 * 1024
+      assert_operator harness.command.bytesize, :<, 4 * 1024
+      refute_includes harness.command, "/usr/share/vim/runtime/file-3999"
+      assert_equal 0600, harness.pty_config_mode
+      refute_path_exists harness.pty_config_path
+      assert_equal guest_files, harness.pty_config.fetch("guestFiles")
+    end
+  end
+
+  def test_pty_execution_removes_config_after_runner_failure
+    Dir.mktmpdir("kandelo-formula-support") do |dir|
+      harness_class = Class.new(Harness) do
+        define_method(:shell_output) do |command, expected_status = 0|
+          super(command, expected_status)
+          raise "runner failed"
+        end
+      end
+      harness = harness_class.new
+      harness.root_path = (Pathname(dir)/"kandelo root").to_s
+      harness.test_path = Pathname(dir)/"formula test"
+      harness.test_path.mkpath
+
+      error = assert_raises(RuntimeError) do
+        harness.kandelo_run_pty_wasm("program.wasm", [], inputs: [])
+      end
+
+      assert_equal "runner failed", error.message
+      refute_path_exists harness.pty_config_path
     end
   end
 
@@ -1236,6 +2143,55 @@ class KandeloFormulaSupportTest < Minitest::Test
 
       assert_includes error.message, "expected fork descendant count must be a nonnegative integer"
     end
+  end
+
+  def test_pty_execution_rejects_invalid_input_readiness_text
+    ["", "x" * 4_097, 17].each do |ready_text|
+      error = assert_raises(RuntimeError) do
+        Harness.new.kandelo_run_pty_wasm(
+          "program.wasm", [], inputs: [], input_ready_text: ready_text
+        )
+      end
+
+      assert_includes(
+        error.message,
+        "input readiness text must be a nonempty string no larger than 4096 bytes",
+      )
+    end
+  end
+
+  def test_pty_execution_rejects_invalid_timeout
+    [0, -1, 1.5, "120000"].each do |timeout_ms|
+      error = assert_raises(RuntimeError) do
+        Harness.new.kandelo_run_pty_wasm(
+          "program.wasm", [], inputs: [], timeout_ms: timeout_ms
+        )
+      end
+
+      assert_includes error.message, "PTY timeout must be a positive integer number of milliseconds"
+    end
+  end
+
+  def test_pty_execution_rejects_invalid_completion_output
+    ["", "ready\0now", 1, "x" * 4097].each do |completion_output|
+      error = assert_raises(RuntimeError) do
+        Harness.new.kandelo_run_pty_wasm(
+          "program.wasm", [], inputs: [], completion_output: completion_output
+        )
+      end
+
+      assert_includes error.message, "PTY completion output must be a nonempty string"
+    end
+  end
+
+  def test_pty_execution_rejects_nonzero_expected_status_with_completion_output
+    error = assert_raises(RuntimeError) do
+      Harness.new.kandelo_run_pty_wasm(
+        "program.wasm", [], inputs: [], completion_output: "ready", expected_status: 1
+      )
+    end
+
+    assert_includes error.message, "PTY completion output requires expected status zero"
   end
 
   def test_pty_execution_rejects_an_empty_guest_argv0

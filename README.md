@@ -12,6 +12,29 @@ The protected dispatch workflows publish with this repository's built-in
 
 This repository is an integration canary, not a supported end-user tap.
 
+## Formula support source
+
+The publisher intentionally requires each Formula to load its support module
+from the same immutable tap checkout. That keeps Formula source, helper code,
+and helper-owned runtime files in one reviewed source closure instead of
+executing mutable code from another tap.
+
+For that reason, the publisher-consumable part of
+`Kandelo/formula_support/` is vendored here as one complete unit. Sync the
+support module and every path outside its top-level `test/` directory from a
+reviewed `Kandelo-dev/homebrew-tap-core` commit; do not copy only the Ruby file
+or patch individual imports to satisfy a newer publisher check. The current
+runtime support closure is synchronized from
+`e447c36f78ef5ab1c060087a9965bed00d4bfc13`, with one general third-party
+adaptation: target dependency isolation recognizes both the attested primary
+tap and `kandelo-dev/tap-core`. That adaptation preserves same-tap dependencies
+without hard-coding this canary's owner or tap name.
+
+The top-level `test/` directory is intentionally tap-local and excluded from
+bottle source identity. It carries the same shared helper tests where they
+apply, plus assertions about this canary's own Formula, without importing
+first-party Formula inventory tests.
+
 ## What this proves
 
 The completed `m4` write proves all of the following:
