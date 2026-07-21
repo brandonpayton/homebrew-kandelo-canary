@@ -25,10 +25,10 @@ support module and every path outside its top-level `test/` directory from a
 reviewed `Kandelo-dev/homebrew-tap-core` commit; do not copy only the Ruby file
 or patch individual imports to satisfy a newer publisher check. The current
 runtime support closure is synchronized from
-`e447c36f78ef5ab1c060087a9965bed00d4bfc13`, with one general third-party
-adaptation: target dependency isolation recognizes both the attested primary
-tap and `kandelo-dev/tap-core`. That adaptation preserves same-tap dependencies
-without hard-coding this canary's owner or tap name.
+`a821def9799bf45d742aae66bb34ffd50bbb41e5`. Its general cross-tap dependency
+isolation recognizes both the attested primary tap and
+`kandelo-dev/tap-core`, preserving same-tap dependencies without hard-coding
+this canary's owner or tap name.
 
 The top-level `test/` directory is intentionally tap-local and excluded from
 bottle source identity. It carries the same shared helper tests where they

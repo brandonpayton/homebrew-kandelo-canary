@@ -220,6 +220,7 @@ class KandeloFormulaSupportTest < Minitest::Test
         support_path:,
         sysroot:,
         tap_name:,
+        tap_root:,
       })
     end
   end
@@ -259,19 +260,22 @@ class KandeloFormulaSupportTest < Minitest::Test
   end
 
   def run_tier2_support_load(fixture, after_require, environment: {}, homebrew_filtered: false)
+    support_paths = environment.fetch("KANDELO_TEST_SUPPORT_PATHS", [fixture.fetch(:support_path)])
+    environment = environment.reject { |key, _value| key == "KANDELO_TEST_SUPPORT_PATHS" }
     env = {
       "HOMEBREW_PREFIX"                 => fixture.fetch(:prefix).to_s,
       "HOMEBREW_KANDELO_ARCH"           => "wasm32",
+      "HOMEBREW_KANDELO_PRIMARY_TAP_ROOT" => fixture.fetch(:tap_root).to_s,
       "HOMEBREW_KANDELO_ROOT"           => fixture.fetch(:root).to_s,
       "HOMEBREW_KANDELO_SYSROOT"        => fixture.fetch(:sysroot).to_s,
       "KANDELO_HOMEBREW_ARCH"           => "wasm32",
       "KANDELO_HOMEBREW_KANDELO_ROOT"   => fixture.fetch(:root).to_s,
       "WASM_POSIX_SYSROOT"              => fixture.fetch(:sysroot).to_s,
     }.merge(environment)
-    source = <<~RUBY
-      require #{fixture.fetch(:support_path).to_s.inspect}
-      #{after_require}
-    RUBY
+    source = [
+      *support_paths.map { |path| "require #{path.to_s.inspect}" },
+      after_require,
+    ].join("\n")
     if homebrew_filtered
       # `bin/brew` rebuilds Formula evaluation's environment from a fixed
       # allowlist plus every HOMEBREW_* value. None of this fixture's fixed
@@ -280,6 +284,17 @@ class KandeloFormulaSupportTest < Minitest::Test
       Open3.capture3(env, RbConfig.ruby, "-e", source, unsetenv_others: true)
     else
       Open3.capture3(env, RbConfig.ruby, "-e", source)
+    end
+  end
+
+  def with_cross_tap_loader_fixture
+    with_tier2_loader_fixture(tap_name: "brandonpayton/kandelo-canary") do |fixture|
+      dependency_tap_root = fixture.fetch(:base)/"kandelo-dev/homebrew-tap-core"
+      dependency_support_path =
+        dependency_tap_root/"Kandelo/formula_support/kandelo_formula_support.rb"
+      dependency_support_path.dirname.mkpath
+      FileUtils.cp(fixture.fetch(:support_path), dependency_support_path)
+      yield fixture.merge(dependency_support_path:, dependency_tap_root:)
     end
   end
 
@@ -490,6 +505,88 @@ class KandeloFormulaSupportTest < Minitest::Test
     end
   end
 
+  def test_identical_cross_tap_support_is_idempotent_without_an_attestation
+    with_cross_tap_loader_fixture do |fixture|
+      primary = fixture.fetch(:support_path)
+      dependency = fixture.fetch(:dependency_support_path)
+      [
+        [primary, dependency],
+        [dependency, primary],
+      ].each do |support_paths|
+        assertion = <<~'RUBY'
+          runtime = KandeloFormulaSupport::KANDELO_TIER2_RUNTIME
+          abort "ordinary evaluation gained authority" unless runtime.fetch("attestation").nil?
+          abort "support API version changed" unless
+            KandeloFormulaSupport::KANDELO_FORMULA_SUPPORT_API_VERSION == 1
+        RUBY
+        _stdout, stderr, status = run_tier2_support_load(
+          fixture,
+          assertion,
+          environment: { "KANDELO_TEST_SUPPORT_PATHS" => support_paths },
+        )
+
+        assert status.success?, "#{support_paths.map(&:to_s).join(" -> ")}: #{stderr}"
+      end
+    end
+  end
+
+  def test_identical_cross_tap_support_preserves_primary_attestation_in_both_load_orders
+    with_cross_tap_loader_fixture do |fixture|
+      document = tier2_loader_attestation(fixture)
+      write_tier2_loader_attestation(fixture, JSON.generate(document))
+      primary = fixture.fetch(:support_path)
+      dependency = fixture.fetch(:dependency_support_path)
+      [
+        [primary, dependency],
+        [dependency, primary],
+      ].each do |support_paths|
+        expected_loaded_support = support_paths.first.realpath.to_s
+        assertion = <<~RUBY
+          runtime = KandeloFormulaSupport::KANDELO_TIER2_RUNTIME
+          abort "attested Formula moved with support load order" unless
+            runtime.fetch("formula_path") == #{fixture.fetch(:formula_path).realpath.to_s.inspect}
+          abort "first support copy did not own the module" unless
+            runtime.fetch("support_path") == #{expected_loaded_support.inspect}
+          abort "primary tap authority changed" unless
+            runtime.fetch("trusted_env").fetch("HOMEBREW_KANDELO_PRIMARY_TAP_ROOT") ==
+              #{fixture.fetch(:tap_root).to_s.inspect}
+        RUBY
+        _stdout, stderr, status = run_tier2_support_load(
+          fixture,
+          assertion,
+          environment: { "KANDELO_TEST_SUPPORT_PATHS" => support_paths },
+        )
+
+        assert status.success?, "#{support_paths.map(&:to_s).join(" -> ")}: #{stderr}"
+      end
+    end
+  end
+
+  def test_cross_tap_support_rejects_mismatched_bytes_in_both_load_orders
+    with_cross_tap_loader_fixture do |fixture|
+      document = tier2_loader_attestation(fixture)
+      write_tier2_loader_attestation(fixture, JSON.generate(document))
+      primary = fixture.fetch(:support_path)
+      dependency = fixture.fetch(:dependency_support_path)
+      dependency.open("ab") { |file| file.write("# incompatible copy\n") }
+      [
+        [[primary, dependency], "support copies are incompatible"],
+        [[dependency, primary], "differs from the Tier-2 attestation"],
+      ].each do |support_paths, expected_error|
+        marker = fixture.fetch(:base)/"mismatch-#{support_paths.first == primary ? "primary" : "dependency"}"
+        _stdout, stderr, status = run_tier2_support_load(
+          fixture,
+          "File.binwrite(#{marker.to_s.inspect}, \"evaluated\\n\")",
+          environment: { "KANDELO_TEST_SUPPORT_PATHS" => support_paths },
+        )
+
+        refute status.success?
+        assert_includes stderr, expected_error
+        refute_path_exists marker
+      end
+    end
+  end
+
   def test_support_load_validates_and_recursively_freezes_an_active_attestation
     with_tier2_loader_fixture do |fixture|
       document = tier2_loader_attestation(fixture)
@@ -510,7 +607,7 @@ class KandeloFormulaSupportTest < Minitest::Test
     end
   end
 
-  def test_target_formula_identity_prefers_the_path_bound_attested_tap
+  def test_target_formula_identity_prefers_the_protected_attested_tap
     with_tier2_loader_fixture(tap_name: "brandonpayton/kandelo-canary") do |fixture|
       document = tier2_loader_attestation(fixture)
       write_tier2_loader_attestation(fixture, JSON.generate(document))
@@ -598,6 +695,10 @@ class KandeloFormulaSupportTest < Minitest::Test
         "missing authoritative arch" => [
           { "HOMEBREW_KANDELO_ARCH" => nil },
           "publisher root or architecture environment is inconsistent",
+        ],
+        "missing primary tap root" => [
+          { "HOMEBREW_KANDELO_PRIMARY_TAP_ROOT" => nil },
+          "did not identify the selected primary tap root",
         ],
         "conflicting root alias" => [
           { "KANDELO_HOMEBREW_KANDELO_ROOT" => fixture.fetch(:base).to_s },
@@ -1940,7 +2041,7 @@ class KandeloFormulaSupportTest < Minitest::Test
       guest_executable.binwrite("\0asm")
       output = harness.kandelo_run_browser_wasm(
         command, ["-e", "console.log(42)"],
-        argv0: "node", env: { "HOME" => "/root" },
+        argv0: "node", guest_program_path: "/opt/node/bin/node", env: { "HOME" => "/root" },
         exec_programs: { "/opt/formula/bin/helper" => guest_executable },
         guest_files: { "/opt/formula/format.dat" => guest_file }, timeout_ms: 5_000
       )
@@ -1954,6 +2055,7 @@ class KandeloFormulaSupportTest < Minitest::Test
       assert_includes harness.command, "expectedStatus"
       assert_includes harness.command, "mergeStderr"
       assert_includes harness.command, "node"
+      assert_includes harness.command, 'guestProgram\":\"/opt/node/bin/node'
       manifest = harness.test_path/"node.browser-guest-files.json"
       assert_equal({ "/opt/formula/format.dat" => guest_file.to_s }, JSON.parse(manifest.read))
       assert_includes harness.command, manifest.to_s.shellescape
@@ -2031,6 +2133,33 @@ class KandeloFormulaSupportTest < Minitest::Test
     end
 
     assert_equal "invalid browser guest command name: ..", error.message
+  end
+
+  def test_browser_execution_rejects_nonabsolute_guest_program_path
+    error = assert_raises(RuntimeError) do
+      Harness.new.kandelo_run_browser_wasm(
+        "program.wasm", [], argv0: "program", guest_program_path: "opt/program/bin/program"
+      )
+    end
+
+    assert_equal(
+      'guest argv0 must be a nonempty normalized absolute path: "opt/program/bin/program"',
+      error.message,
+    )
+  end
+
+  def test_browser_execution_rejects_unnormalized_guest_program_path
+    error = assert_raises(RuntimeError) do
+      Harness.new.kandelo_run_browser_wasm(
+        "program.wasm", [],
+        argv0: "program", guest_program_path: "/opt/program/../bin/program"
+      )
+    end
+
+    assert_equal(
+      'guest argv0 must be a nonempty normalized absolute path: "/opt/program/../bin/program"',
+      error.message,
+    )
   end
 
   def test_pty_execution_uses_tap_owned_runner_and_removes_stale_host_dist
