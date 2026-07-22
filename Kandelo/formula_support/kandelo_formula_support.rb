@@ -8,6 +8,13 @@ require "pathname"
 require "shellwords"
 require "tempfile"
 
+if defined?(KandeloFormulaSupport)
+  unless KandeloFormulaSupport::KANDELO_FORMULA_SUPPORT_API_VERSION == 1 &&
+         Digest::SHA256.file(Pathname(__FILE__).realpath).hexdigest ==
+           KandeloFormulaSupport::KANDELO_TIER2_RUNTIME.fetch("support_sha256")
+    raise "loaded Kandelo Formula support copies are incompatible"
+  end
+else
 # KandeloFormulaSupport is the single place Kandelo-specific mechanics live so
 # that formula bodies stay idiomatic Homebrew. It owns SDK/toolchain activation
 # (via the HOMEBREW_KANDELO_ROOT env bridge), the wasm cross-compile
@@ -21,16 +28,21 @@ require "tempfile"
 # accepted Tier-2 deviation (spec §6) for heavy ported formulae (ruby/perl/…)
 # whose 49 KB `build-<name>.sh` is not yet decomposed into idiomatic steps.
 module KandeloFormulaSupport
+  KANDELO_FORMULA_SUPPORT_API_VERSION = 1
   KANDELO_CORE_TAP_FORMULA_PREFIX = "kandelo-dev/tap-core/"
   KANDELO_TIER2_ATTESTATION_BASENAME = ".kandelo-publisher-tier2-attestation.json"
   KANDELO_TIER2_ATTESTATION_MAX_BYTES = 16_384
   KANDELO_TIER2_SOURCE_MAX_BYTES = 1_048_576
+  KANDELO_SUPPORT_RUNTIME_MAX_FILES = 128
+  KANDELO_SUPPORT_RUNTIME_FILE_MAX_BYTES = 1_048_576
+  KANDELO_SUPPORT_RUNTIME_MAX_BYTES = 16_777_216
   KANDELO_TIER2_SCRIPT_ENV_MAX_KEYS = 64
   KANDELO_TIER2_SCRIPT_ENV_KEY_MAX_BYTES = 4_096
   KANDELO_TIER2_SCRIPT_ENV_VALUE_MAX_BYTES = 4_096
   KANDELO_TIER2_SCRIPT_ENV_VALUE_TOTAL_BYTES = 16_384
   KANDELO_TIER2_TOP_KEYS = %w[
-    arch formula formula_sha256 full_name schema support_sha256 tap tier2_bridge
+    arch formula formula_sha256 full_name schema support_runtime_sha256
+    support_sha256 tap tier2_bridge
   ].freeze
   KANDELO_TIER2_BRIDGE_KEYS = %w[
     build_toml_sha256 package package_toml_sha256 script script_env_keys
@@ -38,7 +50,8 @@ module KandeloFormulaSupport
   ].freeze
   KANDELO_TIER2_TRUSTED_ENV_KEYS = %w[
     HOMEBREW_KANDELO_ARCH HOMEBREW_KANDELO_LLVM_BIN HOMEBREW_KANDELO_NODE
-    HOMEBREW_KANDELO_ROOT HOMEBREW_KANDELO_SYSROOT KANDELO_HOMEBREW_ARCH
+    HOMEBREW_KANDELO_PRIMARY_TAP_ROOT HOMEBREW_KANDELO_ROOT
+    HOMEBREW_KANDELO_SYSROOT KANDELO_HOMEBREW_ARCH
     KANDELO_HOMEBREW_KANDELO_ROOT LLVM_BIN WASM_POSIX_LLVM_DIR
     WASM_POSIX_SYSROOT
   ].freeze
@@ -50,7 +63,8 @@ module KandeloFormulaSupport
   # this file and retain an inert nil authority.
   def self.kandelo_load_tier2_runtime!
     support_path = Pathname(__FILE__).realpath
-    secure_read = lambda do |path, max_bytes, label, expected_uid: nil, expected_mode: nil|
+    secure_read = lambda do |path, max_bytes, label, expected_uid: nil, expected_mode: nil,
+                            allow_empty: false, utf8: true|
       begin
         before = path.lstat
       rescue SystemCallError => e
@@ -82,11 +96,15 @@ module KandeloFormulaSupport
           raise "#{label} changed while it was read: #{path}"
         end
       end
-      unless bytes&.bytesize&.between?(1, max_bytes)
-        raise "#{label} must contain 1 to #{max_bytes} bytes: #{path}"
+      bytes = +"".b if allow_empty && bytes.nil?
+      minimum_bytes = allow_empty ? 0 : 1
+      unless bytes&.bytesize&.between?(minimum_bytes, max_bytes)
+        raise "#{label} must contain #{minimum_bytes} to #{max_bytes} bytes: #{path}"
       end
-      bytes.force_encoding(Encoding::UTF_8)
-      raise "#{label} is not UTF-8: #{path}" unless bytes.valid_encoding?
+      if utf8
+        bytes.force_encoding(Encoding::UTF_8)
+        raise "#{label} is not UTF-8: #{path}" unless bytes.valid_encoding?
+      end
 
       bytes
     end
@@ -122,19 +140,52 @@ module KandeloFormulaSupport
 
     support_dir = support_path.dirname
     kandelo_dir = support_dir.dirname
-    tap_root = kandelo_dir.dirname
+    loaded_tap_root = kandelo_dir.dirname
     unless support_path.basename.to_s == "kandelo_formula_support.rb" &&
            support_dir.basename.to_s == "formula_support" &&
            kandelo_dir.basename.to_s == "Kandelo"
       raise "Kandelo Formula support has an unexpected path: #{support_path}"
     end
-    [support_dir, kandelo_dir, tap_root].each do |directory|
+    [support_dir, kandelo_dir, loaded_tap_root].each do |directory|
       exact_directory.call(directory, "Kandelo Formula support ancestor")
     end
     support_source = secure_read.call(
       support_path, KANDELO_TIER2_SOURCE_MAX_BYTES, "Kandelo Formula support"
     )
     support_sha256 = Digest::SHA256.hexdigest(support_source)
+    support_runtime_files = {}
+    support_runtime_bytes = 0
+    support_dir.each_child do |entry|
+      basename = entry.basename.to_s
+      if basename == "test"
+        exact_directory.call(entry, "Kandelo Formula support test path")
+        next
+      end
+      unless basename.match?(/\A[A-Za-z0-9][A-Za-z0-9._-]*\z/) &&
+             entry.parent == support_dir
+        raise "Kandelo Formula support runtime entry has a noncanonical path: #{entry}"
+      end
+      if support_runtime_files.length >= KANDELO_SUPPORT_RUNTIME_MAX_FILES
+        raise "Kandelo Formula support runtime exceeds #{KANDELO_SUPPORT_RUNTIME_MAX_FILES} files: #{support_dir}"
+      end
+      entry_source = secure_read.call(
+        entry,
+        KANDELO_SUPPORT_RUNTIME_FILE_MAX_BYTES,
+        "Kandelo Formula support runtime entry",
+        allow_empty: true,
+        utf8: false,
+      )
+      support_runtime_bytes += entry_source.bytesize
+      if support_runtime_bytes > KANDELO_SUPPORT_RUNTIME_MAX_BYTES
+        raise "Kandelo Formula support runtime exceeds the byte limit: #{support_dir}"
+      end
+      support_runtime_files[basename] = Digest::SHA256.hexdigest(entry_source)
+    end
+    support_runtime_files = support_runtime_files.sort.to_h
+    unless support_runtime_files.fetch(support_path.basename.to_s, nil) == support_sha256
+      raise "Kandelo Formula support changed while its runtime tree was read: #{support_path}"
+    end
+    support_runtime_sha256 = Digest::SHA256.hexdigest(JSON.generate(support_runtime_files))
 
     prefix_value = if defined?(HOMEBREW_PREFIX)
       HOMEBREW_PREFIX.to_s
@@ -155,6 +206,7 @@ module KandeloFormulaSupport
       "attestation_path" => attestation_path&.to_s,
       "formula_path" => nil,
       "support_path" => support_path.to_s,
+      "support_runtime_sha256" => support_runtime_sha256,
       "support_sha256" => support_sha256,
       "trusted_env" => trusted_env,
     }
@@ -266,7 +318,7 @@ module KandeloFormulaSupport
     unless document.is_a?(Hash) && document.keys.sort == KANDELO_TIER2_TOP_KEYS
       raise "Tier-2 attestation must use the exact top-level schema"
     end
-    unless document["schema"] == 1
+    unless document["schema"] == 2
       raise "Tier-2 attestation uses an unsupported schema"
     end
     tap_identity = document["tap"]
@@ -275,6 +327,7 @@ module KandeloFormulaSupport
     arch = document["arch"]
     formula_sha256 = document["formula_sha256"]
     attested_support_sha256 = document["support_sha256"]
+    attested_support_runtime_sha256 = document["support_runtime_sha256"]
     bridge = document["tier2_bridge"]
     valid_sha256 = lambda do |value|
       value.is_a?(String) && value.match?(/\A[0-9a-f]{64}\z/)
@@ -283,7 +336,9 @@ module KandeloFormulaSupport
            formula.is_a?(String) && formula.match?(/\A[a-z0-9][a-z0-9._-]{0,254}\z/) &&
            full_name == "#{tap_identity}/#{formula}" && ["wasm32", "wasm64"].include?(arch) &&
            valid_sha256.call(formula_sha256) &&
-           (attested_support_sha256.nil? || valid_sha256.call(attested_support_sha256))
+           ((attested_support_sha256.nil? && attested_support_runtime_sha256.nil?) ||
+             (valid_sha256.call(attested_support_sha256) &&
+              valid_sha256.call(attested_support_runtime_sha256)))
       raise "Tier-2 attestation has an invalid target identity"
     end
     unless bridge.nil? || (bridge.is_a?(Hash) && bridge.keys.sort == KANDELO_TIER2_BRIDGE_KEYS)
@@ -315,14 +370,26 @@ module KandeloFormulaSupport
       raise "Tier-2 attestation has invalid bridge values" unless valid_bridge
     end
 
+    primary_tap_root_value = trusted_env.fetch("HOMEBREW_KANDELO_PRIMARY_TAP_ROOT").to_s
+    if primary_tap_root_value.empty?
+      raise "Tier-2 publisher did not identify the selected primary tap root"
+    end
+    primary_tap_root, = exact_directory.call(
+      Pathname(primary_tap_root_value), "selected primary tap root"
+    )
     owner, short_tap = tap_identity.split("/", 2)
-    unless tap_root.basename.to_s == "homebrew-#{short_tap}" && tap_root.parent.basename.to_s == owner
-      raise "Tier-2 attestation tap identity differs from the loaded support path"
+    unless primary_tap_root.basename.to_s == "homebrew-#{short_tap}" &&
+           primary_tap_root.parent.basename.to_s == owner
+      raise "Tier-2 attestation tap identity differs from the selected primary tap root"
     end
     if !attested_support_sha256.nil? && support_sha256 != attested_support_sha256
       raise "loaded Kandelo Formula support differs from the Tier-2 attestation"
     end
-    formula_path = tap_root/"Formula"/"#{formula}.rb"
+    if !attested_support_runtime_sha256.nil? &&
+       support_runtime_sha256 != attested_support_runtime_sha256
+      raise "loaded Kandelo Formula support runtime differs from the Tier-2 attestation"
+    end
+    formula_path = primary_tap_root/"Formula"/"#{formula}.rb"
     formula_source = secure_read.call(
       formula_path, KANDELO_TIER2_SOURCE_MAX_BYTES, "Tier-2 Formula"
     )
@@ -374,10 +441,10 @@ module KandeloFormulaSupport
   KANDELO_TIER2_RUNTIME = kandelo_load_tier2_runtime!
 
   # Treat dependencies from both the canonical core tap and the Formula's own
-  # tap as Kandelo target programs. During publication, the attestation has
-  # already bound its tap identity to this support file's real path. Ordinary
-  # local Formula evaluation has no attestation, so use Homebrew's fully
-  # qualified Formula identity instead.
+  # tap as Kandelo target programs. During publication, the protected primary
+  # tap root binds that identity independently of support-file load order.
+  # Ordinary local Formula evaluation has no attestation, so use Homebrew's
+  # fully qualified Formula identity instead.
   def kandelo_primary_tap_formula_prefix
     primary_tap = KANDELO_TIER2_RUNTIME.dig("attestation", "tap").to_s
     primary_tap = full_name.to_s.rpartition("/").first if primary_tap.empty?
@@ -886,7 +953,8 @@ module KandeloFormulaSupport
   def kandelo_tier2_restore_environment!(runtime, package)
     package_prefix = "#{package.upcase.gsub(/[^A-Z0-9]/, "_")}_"
     explicit = %w[
-      HOMEBREW_KANDELO_ARCH HOMEBREW_KANDELO_ROOT HOMEBREW_KANDELO_SYSROOT
+      HOMEBREW_KANDELO_ARCH HOMEBREW_KANDELO_PRIMARY_TAP_ROOT
+      HOMEBREW_KANDELO_ROOT HOMEBREW_KANDELO_SYSROOT
       KANDELO_HOMEBREW_ARCH KANDELO_HOMEBREW_KANDELO_ROOT
       WASM_POSIX_BINARY_INDEX_URL WASM_POSIX_DEFAULT_ARCH
       WASM_POSIX_INSTALL_LOCAL_MIRROR WASM_POSIX_SYSROOT
@@ -1419,14 +1487,15 @@ module KandeloFormulaSupport
   # intentionally separate from the Node runner: browser worker startup,
   # SharedArrayBuffer isolation, Wasm memory, and process teardown are distinct
   # platform contracts. `argv0:` controls the guest command name for multicall
-  # runtimes whose behavior depends on argv[0]. `exec_programs:` stages
-  # executable Wasm programs for spawn/exec behavior, while immutable
-  # `guest_files:` use the same absolute-path and bounded-rootfs contract as
-  # Node formula tests. `expected_status:` and `merge_stderr:` permit exact
-  # negative-path checks without converting a guest failure into a
-  # browser-runner failure.
+  # runtimes whose behavior depends on argv[0]. `guest_program_path:` stages
+  # the primary executable at an installed absolute guest path when runtime
+  # prefix discovery depends on that path. `exec_programs:` stages executable
+  # Wasm programs for spawn/exec behavior, while immutable `guest_files:` use
+  # the same absolute-path and bounded-rootfs contract as Node formula tests.
+  # `expected_status:` and `merge_stderr:` permit exact negative-path checks
+  # without converting a guest failure into a browser-runner failure.
   def kandelo_run_browser_wasm(
-    bin_path, argv, argv0: nil, env: {}, exec_programs: {}, guest_files: {},
+    bin_path, argv, argv0: nil, guest_program_path: nil, env: {}, exec_programs: {}, guest_files: {},
     timeout_ms: 120_000, allow_stderr: false, merge_stderr: false, expected_status: 0
   )
     root = kandelo_require_root!
@@ -1441,8 +1510,9 @@ module KandeloFormulaSupport
     invalid_command_name = command_name.empty? || command_name.include?("/") ||
                            command_name.include?("\0") || [".", ".."].include?(command_name)
     odie "invalid browser guest command name: #{command_name}" if invalid_command_name
+    kandelo_validate_guest_argv0!(guest_program_path)
 
-    config = JSON.generate({
+    config_values = {
       argv:           argv.map(&:to_s),
       argv0:          command_name,
       env:            env.transform_values(&:to_s),
@@ -1450,7 +1520,9 @@ module KandeloFormulaSupport
       allowStderr:    allow_stderr,
       mergeStderr:    merge_stderr,
       expectedStatus: expected_status,
-    })
+    }
+    config_values[:guestProgram] = guest_program_path unless guest_program_path.nil?
+    config = JSON.generate(config_values)
     guest_files_manifest = testpath/"#{wasm_path.basename}.browser-guest-files.json"
     File.binwrite(
       guest_files_manifest,
@@ -1533,4 +1605,5 @@ module KandeloFormulaSupport
   ensure
     File.delete(temp_path) if temp_path&.exist?
   end
+end
 end
