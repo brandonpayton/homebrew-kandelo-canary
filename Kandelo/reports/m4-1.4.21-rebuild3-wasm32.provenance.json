@@ -1,0 +1,115 @@
+{
+  "bottle": {
+    "bottle_tag": "wasm32_kandelo",
+    "bytes": 467556,
+    "cache_key_sha": "d1e4f8a3967c3e37844552faa1ce2777b57fa6e8fb58bcf11d407844a9ffefca",
+    "cellar": "/home/linuxbrew/.linuxbrew/Cellar",
+    "prefix": "/home/linuxbrew/.linuxbrew",
+    "sha256": "d1e4f8a3967c3e37844552faa1ce2777b57fa6e8fb58bcf11d407844a9ffefca",
+    "url": "https://ghcr.io/v2/brandonpayton/homebrew-kandelo-canary/m4/blobs/sha256:d1e4f8a3967c3e37844552faa1ce2777b57fa6e8fb58bcf11d407844a9ffefca"
+  },
+  "build": {
+    "brew_version": "Homebrew source commit 34c40c18ffa2029b611b61c73273e32c003d0842",
+    "dev_shell": "scripts/dev-shell.sh",
+    "github_run": "https://github.com/brandonpayton/homebrew-kandelo-canary/actions/runs/29886510154",
+    "job": "verify-bottle",
+    "runner_os": "Linux",
+    "sdk_fingerprint": "a7ef0c406359039ee25d54e4f8baee3afdc857cdbcac5df9a065ef875b3a3b48",
+    "sysroot_fingerprint": "2e67ce1d1776b3ab8b2f8cc89f88bfa805369487f19b6a2eb154c4919dd1fe96"
+  },
+  "formula": {
+    "path": "Formula/m4.rb",
+    "sha256": "c18df59b12a254bfe3a6c888f4de891a5876a3078a1baf130a84b1f773f4a86f"
+  },
+  "metadata": {
+    "formula_json": {
+      "path": "Kandelo/formula/m4.json",
+      "sha256": "4ad48465005a160afceced9dbc6f1e5372101934233e0e9a192c370beb3f6a79"
+    },
+    "link_manifest_json": {
+      "path": "Kandelo/link/m4-1.4.21-rebuild3-wasm32.json",
+      "sha256": "d323d5afcb1137851b7c44504bdca31e591dc4e595ab35bd26445086962b55ea"
+    },
+    "metadata_json": {
+      "path": "Kandelo/metadata.json",
+      "sha256": "22448e3699c6873ebbd380e81ab442cb74393cb9db4fa1fe0d992787661c6ae8"
+    },
+    "provenance_json": {
+      "path": "Kandelo/reports/m4-1.4.21-rebuild3-wasm32.provenance.json",
+      "sha256": "401a1bf728b2cc61e99da93de4fabedac7acb5c8526787bd832b80b9c8572328"
+    }
+  },
+  "repositories": {
+    "kandelo_commit": "466a685d9366d3b712c4fe998307e00157bd5d15",
+    "kandelo_repository": "Automattic/kandelo",
+    "tap_commit": "ee4464b87b988b163608b6c3520c2260907bda61",
+    "tap_repository": "brandonpayton/homebrew-kandelo-canary"
+  },
+  "schema": 1,
+  "subject": {
+    "arch": "wasm32",
+    "bottle_rebuild": 3,
+    "kandelo_abi": 41,
+    "package": "m4",
+    "version": "1.4.21"
+  },
+  "validation": {
+    "outcome_lists": [
+      {
+        "failed": [],
+        "name": "schema",
+        "passed": [
+          "Kandelo/metadata.json",
+          "Kandelo/formula/m4.json",
+          "Kandelo/link/m4-1.4.21-rebuild3-wasm32.json",
+          "Kandelo/reports/m4-1.4.21-rebuild3-wasm32.provenance.json"
+        ],
+        "skipped": [],
+        "status": "success"
+      },
+      {
+        "failed": [],
+        "name": "homebrew_audit",
+        "passed": [],
+        "skip_reason": "kd-8ho.5 validates the first bottle build and sidecars; tap audit can run in the real tap publication gate.",
+        "skipped": [
+          "brew audit was not part of kd-8ho.5 local verification"
+        ],
+        "status": "skipped"
+      },
+      {
+        "failed": [],
+        "name": "bottle_build",
+        "passed": [
+          "brew install --build-bottle",
+          "brew test",
+          "brew bottle --json --keep-old",
+          "scripts/homebrew-merge-bottle-json.sh statically composed canonical bottle metadata"
+        ],
+        "skipped": [],
+        "status": "success"
+      },
+      {
+        "failed": [],
+        "name": "node_smoke",
+        "passed": [
+          "Homebrew force-poured m4 from anonymous-public-readback",
+          "brew test emitted Kandelo Node receipt via kandelo_run_wasm",
+          "exact bottle sha256: d1e4f8a3967c3e37844552faa1ce2777b57fa6e8fb58bcf11d407844a9ffefca"
+        ],
+        "skipped": [],
+        "status": "success"
+      },
+      {
+        "failed": [],
+        "name": "browser_smoke",
+        "passed": [],
+        "skip_reason": "No successful browser VFS smoke was recorded for this bottle.",
+        "skipped": [
+          "browser_compatible is false for this bottle"
+        ],
+        "status": "skipped"
+      }
+    ]
+  }
+}
