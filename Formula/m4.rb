@@ -59,9 +59,12 @@ class M4 < Formula
       )
   end
 
+  # WHY: Kandelo's ABI is not part of Homebrew's GHCR bottle identity.
+  # Rebuild 4 keeps the ABI 42 publication from colliding with immutable
+  # rebuild 3, while its last-green checksum remains review evidence.
   bottle do
     root_url "https://ghcr.io/v2/brandonpayton/homebrew-kandelo-canary"
-    rebuild 3
+    rebuild 4
     sha256 cellar: :any_skip_relocation, wasm32_kandelo: "d1e4f8a3967c3e37844552faa1ce2777b57fa6e8fb58bcf11d407844a9ffefca"
   end
 end

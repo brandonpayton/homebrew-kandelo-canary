@@ -73,12 +73,19 @@ write must produce cross-tap closure evidence and boot the composed VFS image
 under both supported hosts:
 
 ```bash
+CANARY_TAP_SHA="$(gh api \
+  repos/brandonpayton/homebrew-kandelo-canary/commits/main \
+  --jq '.sha')"
 gh api -X POST repos/brandonpayton/homebrew-kandelo-canary/dispatches \
   -f event_type=publish-kandelo-bottles \
   -f 'client_payload[formulae]=m4' \
   -f 'client_payload[arches]=wasm32' \
+  -f "client_payload[tap_sha]=${CANARY_TAP_SHA}" \
   -F 'client_payload[require_vfs_acceptance]=true'
 ```
+
+The exact `tap_sha` binds publication to the reviewed Formula snapshot even if
+the default branch advances before the run starts.
 
 The write workflow contains the same pre-upload planning, build, and local
 handoff validation as the dry-run workflow. It additionally exercises the
