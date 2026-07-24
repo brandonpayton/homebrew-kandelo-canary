@@ -10,10 +10,10 @@ jobs:
       actions: read
       contents: write
       packages: write
-    uses: Automattic/kandelo/.github/workflows/reusable-homebrew-bottle-publish.yml@466a685d9366d3b712c4fe998307e00157bd5d15
+    uses: Automattic/kandelo/.github/workflows/reusable-homebrew-bottle-publish.yml@d3805721b887a19382ef1c96b576fc27badc0951
     with:
       kandelo-repository: Automattic/kandelo
-      kandelo-ref: main
+      kandelo-ref: d3805721b887a19382ef1c96b576fc27badc0951
       tap-repository: brandonpayton/homebrew-kandelo-canary
       tap-name: brandonpayton/kandelo-canary
       tap-ref: main
@@ -24,3 +24,10 @@ jobs:
       force: ${{ github.event.client_payload.force || false }}
       dry-run: false
       require-vfs-acceptance: ${{ github.event.client_payload.require_vfs_acceptance || false }}
+      # WHY: ABI 42's package archives were produced immediately before the
+      # publisher bridge. The bridge proves this sealed generation is an exact
+      # ancestor with the same rootfs closure instead of rebuilding from a
+      # mutable release index.
+      prepublication-staging-tag: pr-1079-staging
+      prepublication-staging-kandelo-sha: 437fde2524ea6ad9c44933f8abbf995a46841009
+      defer-vfs-acceptance-until-postpublication: ${{ github.event.client_payload.require_vfs_acceptance || false }}

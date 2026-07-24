@@ -25,10 +25,19 @@ support module and every path outside its top-level `test/` directory from a
 reviewed `Kandelo-dev/homebrew-tap-core` commit; do not copy only the Ruby file
 or patch individual imports to satisfy a newer publisher check. The current
 runtime support closure is synchronized from
-`a821def9799bf45d742aae66bb34ffd50bbb41e5`. Its general cross-tap dependency
+`28ffdfa6261c82acb77cab8b1608267f9ba884c6`. Its general cross-tap dependency
 isolation recognizes both the attested primary tap and
 `kandelo-dev/tap-core`, preserving same-tap dependencies without hard-coding
 this canary's owner or tap name.
+
+The canary declares Binaryen and WABT through the support unit's sealed native
+Requirement classes. Those executables belong to the trusted publisher host,
+not the guest bottle dependency graph; `kandelo-dev/tap-core/dash` remains the
+real runtime dependency installed with `m4`.
+
+`Kandelo/dependency-taps.json` locks that Dash source and bottle closure to the
+same reviewed core-tap commit. Advancing the support runtime or Dash requires
+reviewing both identities together.
 
 The top-level `test/` directory is intentionally tap-local and excluded from
 bottle source identity. It carries the same shared helper tests where they
