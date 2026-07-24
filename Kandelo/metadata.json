@@ -1,39 +1,39 @@
 {
-  "generated_at": "2026-07-22T03:14:07Z",
+  "generated_at": "2026-07-24T22:05:30Z",
   "generator": "kandelo-homebrew-publish 1",
-  "kandelo_abi": 41,
-  "kandelo_commit": "466a685d9366d3b712c4fe998307e00157bd5d15",
+  "kandelo_abi": 42,
+  "kandelo_commit": "d3805721b887a19382ef1c96b576fc27badc0951",
   "kandelo_repository": "Automattic/kandelo",
   "packages": [
     {
-      "bottle_rebuild": 3,
+      "bottle_rebuild": 4,
       "bottles": [
         {
           "arch": "wasm32",
           "bottle_tag": "wasm32_kandelo",
           "browser_compatible": false,
-          "built_at": "2026-07-22T03:14:07Z",
-          "built_by": "https://github.com/brandonpayton/homebrew-kandelo-canary/actions/runs/29886510154",
+          "built_at": "2026-07-24T22:05:30Z",
+          "built_by": "https://github.com/brandonpayton/homebrew-kandelo-canary/actions/runs/30128524643",
           "built_from": {
-            "formula_sha256": "c18df59b12a254bfe3a6c888f4de891a5876a3078a1baf130a84b1f773f4a86f",
-            "kandelo_commit": "466a685d9366d3b712c4fe998307e00157bd5d15",
+            "formula_sha256": "6ae0bf797b9531bf3ebc0ee53a0b1995eea40f2106a6bb95fb81d4f0810a8b75",
+            "kandelo_commit": "d3805721b887a19382ef1c96b576fc27badc0951",
             "kandelo_repository": "Automattic/kandelo",
-            "tap_commit": "ee4464b87b988b163608b6c3520c2260907bda61",
+            "tap_commit": "e036e44b6520f7851675926486c42d8f60992496",
             "tap_repository": "brandonpayton/homebrew-kandelo-canary"
           },
-          "bytes": 467556,
-          "cache_key_sha": "d1e4f8a3967c3e37844552faa1ce2777b57fa6e8fb58bcf11d407844a9ffefca",
+          "bytes": 467671,
+          "cache_key_sha": "8f989bd82874d080c3668d7422354179da5ad89bf1c3e9ecc20f660027dd1b35",
           "cellar": "/home/linuxbrew/.linuxbrew/Cellar",
           "fork_instrumentation": "not-required",
-          "kandelo_abi": 41,
-          "link_manifest": "Kandelo/link/m4-1.4.21-rebuild3-wasm32.json",
+          "kandelo_abi": 42,
+          "link_manifest": "Kandelo/link/m4-1.4.21-rebuild4-wasm32.json",
           "prefix": "/home/linuxbrew/.linuxbrew",
           "runtime_support": [
             "node"
           ],
-          "sha256": "d1e4f8a3967c3e37844552faa1ce2777b57fa6e8fb58bcf11d407844a9ffefca",
+          "sha256": "8f989bd82874d080c3668d7422354179da5ad89bf1c3e9ecc20f660027dd1b35",
           "status": "success",
-          "url": "https://ghcr.io/v2/brandonpayton/homebrew-kandelo-canary/m4/blobs/sha256:d1e4f8a3967c3e37844552faa1ce2777b57fa6e8fb58bcf11d407844a9ffefca"
+          "url": "https://ghcr.io/v2/brandonpayton/homebrew-kandelo-canary/m4/blobs/sha256:8f989bd82874d080c3668d7422354179da5ad89bf1c3e9ecc20f660027dd1b35"
         }
       ],
       "dependencies": [
@@ -51,9 +51,9 @@
       "version": "1.4.21"
     }
   ],
-  "release_tag": "bottles-abi-v41",
+  "release_tag": "bottles-abi-v42",
   "schema": 1,
-  "tap_commit": "ee4464b87b988b163608b6c3520c2260907bda61",
+  "tap_commit": "e036e44b6520f7851675926486c42d8f60992496",
   "tap_name": "brandonpayton/kandelo-canary",
   "tap_repository": "brandonpayton/homebrew-kandelo-canary"
 }
