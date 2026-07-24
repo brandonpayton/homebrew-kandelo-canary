@@ -30,6 +30,7 @@ else
 module KandeloFormulaSupport
   KANDELO_FORMULA_SUPPORT_API_VERSION = 1
   KANDELO_CORE_TAP_FORMULA_PREFIX = "kandelo-dev/tap-core/"
+  KANDELO_PORTABLE_BINARY_CACHE_BASENAME = ".ci-test-binary-cache"
   KANDELO_TIER2_ATTESTATION_BASENAME = ".kandelo-publisher-tier2-attestation.json"
   KANDELO_TIER2_ATTESTATION_MAX_BYTES = 16_384
   KANDELO_TIER2_SOURCE_MAX_BYTES = 1_048_576
@@ -51,10 +52,39 @@ module KandeloFormulaSupport
   KANDELO_TIER2_TRUSTED_ENV_KEYS = %w[
     HOMEBREW_KANDELO_ARCH HOMEBREW_KANDELO_LLVM_BIN HOMEBREW_KANDELO_NODE
     HOMEBREW_KANDELO_PRIMARY_TAP_ROOT HOMEBREW_KANDELO_ROOT
-    HOMEBREW_KANDELO_SYSROOT KANDELO_HOMEBREW_ARCH
+    HOMEBREW_KANDELO_SYSROOT HOMEBREW_KANDELO_XTASK_BIN KANDELO_HOMEBREW_ARCH
     KANDELO_HOMEBREW_KANDELO_ROOT LLVM_BIN WASM_POSIX_LLVM_DIR
     WASM_POSIX_SYSROOT
   ].freeze
+
+  # These tools exist only in the trusted Linux publisher. Model them as
+  # Homebrew Requirements so a stock Kandelo guest can prune them with the
+  # build graph before it tries to resolve homebrew/core Formula metadata.
+  # The publisher statically validates this exact class shape and restores the
+  # named, sealed host tools to source builds and Formula tests.
+  # Declares the sealed Binaryen optimizer used by artifact validation.
+  class BinaryenRequirement < Requirement
+    KANDELO_NATIVE_FORMULA = "binaryen"
+    KANDELO_NATIVE_SENTINEL = "wasm-opt"
+    fatal true
+    satisfy(build_env: false) { which("wasm-opt") }
+  end
+
+  # Declares the sealed pkgconf executable used by build and test probes.
+  class PkgconfRequirement < Requirement
+    KANDELO_NATIVE_FORMULA = "pkgconf"
+    KANDELO_NATIVE_SENTINEL = "pkg-config"
+    fatal true
+    satisfy(build_env: false) { which("pkg-config") }
+  end
+
+  # Declares the sealed WABT validator used by artifact validation.
+  class WabtRequirement < Requirement
+    KANDELO_NATIVE_FORMULA = "wabt"
+    KANDELO_NATIVE_SENTINEL = "wasm-validate"
+    fatal true
+    satisfy(build_env: false) { which("wasm-validate") }
+  end
 
   # The publisher writes one root-owned, read-only attestation at a fixed path
   # before Homebrew evaluates any Formula. Load it while this support module is
@@ -201,9 +231,111 @@ module KandeloFormulaSupport
       value = ENV.fetch(key, nil)
       [key, value.nil? ? nil : value.to_s]
     end
+    formula_binary_cache_root = nil
+    formula_checker_path = nil
+    checker_value = trusted_env.fetch("HOMEBREW_KANDELO_XTASK_BIN").to_s
+    unless checker_value.empty?
+      root_value = trusted_env.fetch("HOMEBREW_KANDELO_ROOT").to_s
+      if root_value.empty?
+        raise "Kandelo Formula checker requires the authoritative Kandelo root"
+      end
+      root, = exact_directory.call(Pathname(root_value), "Kandelo root")
+      checker = Pathname(checker_value)
+      expanded_checker = checker.expand_path.cleanpath
+      unless checker.absolute? && checker == expanded_checker
+        raise "Kandelo Formula checker must be an absolute normalized path: #{checker}"
+      end
+      begin
+        before = checker.lstat
+        resolved = checker.realpath
+      rescue SystemCallError => e
+        raise "Kandelo Formula checker is unavailable at #{checker}: #{e.message}"
+      end
+      relative_checker = checker.relative_path_from(root)
+      unless resolved == checker && relative_checker.to_s != "." &&
+             relative_checker.each_filename.none? { |part| part == ".." }
+        raise "Kandelo Formula checker must be inside the authoritative Kandelo root: #{checker}"
+      end
+      # Match the publisher's one sealed alias location exactly. Merely being a
+      # protected file below the checkout is not enough: unrelated root-owned
+      # tooling there must never become Formula runner authority.
+      checker_parts = relative_checker.each_filename.to_a
+      unless checker_parts.length == 4 &&
+             checker_parts[0] == "target" &&
+             checker_parts[1].match?(/\A[A-Za-z0-9_.+\-]+\z/) &&
+             checker_parts[2] == "release" &&
+             checker_parts[3] == "xtask"
+        raise "Kandelo Formula checker must be at target/<host>/release/xtask " \
+              "inside the authoritative Kandelo root: #{checker}"
+      end
+      unless before.file? && !before.symlink? && before.size.positive? && before.nlink == 1 &&
+             before.uid.zero? && (before.mode & 07777) == 0555
+        raise "Kandelo Formula checker must be a nonempty, root-owned, mode-0555 " \
+              "regular file with one link: #{checker}"
+      end
+
+      # The publisher makes this source-alias tree non-replaceable by the
+      # Formula user. Opening the reviewed inode also closes the lstat/open
+      # race before we freeze the only checker path runners may propagate.
+      File.open(checker, "rb") do |file|
+        opened_before = file.stat
+        identity = [
+          before.dev, before.ino, before.size, before.uid, before.gid,
+          before.mode, before.nlink,
+        ]
+        opened_identity = [
+          opened_before.dev, opened_before.ino, opened_before.size,
+          opened_before.uid, opened_before.gid, opened_before.mode,
+          opened_before.nlink,
+        ]
+        raise "Kandelo Formula checker changed before it was opened: #{checker}" unless opened_identity == identity
+
+        opened_after = file.stat
+        after = checker.lstat
+        final_identity = [
+          after.dev, after.ino, after.size, after.uid, after.gid,
+          after.mode, after.nlink,
+        ]
+        opened_final_identity = [
+          opened_after.dev, opened_after.ino, opened_after.size,
+          opened_after.uid, opened_after.gid, opened_after.mode,
+          opened_after.nlink,
+        ]
+        unless final_identity == identity && opened_final_identity == identity
+          raise "Kandelo Formula checker changed while it was opened: #{checker}"
+        end
+      end
+
+      # WHY: binaries/ contains relative links into this transported cache.
+      # Keeping both fixed below the same frozen source root preserves the
+      # package generation identity that prevents cross-package mixing.
+      binary_cache_candidate = root/KANDELO_PORTABLE_BINARY_CACHE_BASENAME
+      binary_cache_root, = exact_directory.call(
+        binary_cache_candidate, "Kandelo Formula binary cache"
+      )
+      unless binary_cache_root.parent == root &&
+             binary_cache_root.basename.to_s == KANDELO_PORTABLE_BINARY_CACHE_BASENAME
+        raise "Kandelo Formula binary cache must be the fixed direct child of " \
+              "the authoritative Kandelo root: #{binary_cache_candidate}"
+      end
+      programs_candidate = binary_cache_root/"programs"
+      programs_root, = exact_directory.call(
+        programs_candidate, "Kandelo Formula binary cache programs root"
+      )
+      unless programs_root.parent == binary_cache_root &&
+             programs_root.basename.to_s == "programs"
+        raise "Kandelo Formula binary cache programs root must be the fixed direct child of " \
+              "the Formula binary cache: #{programs_candidate}"
+      end
+
+      formula_binary_cache_root = binary_cache_root.to_s
+      formula_checker_path = checker.to_s
+    end
     runtime = {
       "attestation" => nil,
       "attestation_path" => attestation_path&.to_s,
+      "formula_binary_cache_root" => formula_binary_cache_root,
+      "formula_checker_path" => formula_checker_path,
       "formula_path" => nil,
       "support_path" => support_path.to_s,
       "support_runtime_sha256" => support_runtime_sha256,
@@ -956,7 +1088,8 @@ module KandeloFormulaSupport
       HOMEBREW_KANDELO_ARCH HOMEBREW_KANDELO_PRIMARY_TAP_ROOT
       HOMEBREW_KANDELO_ROOT HOMEBREW_KANDELO_SYSROOT
       KANDELO_HOMEBREW_ARCH KANDELO_HOMEBREW_KANDELO_ROOT
-      WASM_POSIX_BINARY_INDEX_URL WASM_POSIX_DEFAULT_ARCH
+      WASM_POSIX_BINARY_CACHE_ROOT WASM_POSIX_BINARY_INDEX_URL
+      WASM_POSIX_BINARY_RESOLVER_REPO_ROOT WASM_POSIX_DEFAULT_ARCH
       WASM_POSIX_INSTALL_LOCAL_MIRROR WASM_POSIX_SYSROOT
     ]
     ENV.keys.each do |key|
@@ -965,6 +1098,12 @@ module KandeloFormulaSupport
     end
     runtime.fetch("trusted_env").each do |key, value|
       value.nil? ? ENV.delete(key) : ENV[key] = value
+    end
+    binary_cache_root = runtime.fetch("formula_binary_cache_root", nil)
+    unless binary_cache_root.nil?
+      ENV["WASM_POSIX_BINARY_CACHE_ROOT"] = binary_cache_root
+      ENV["WASM_POSIX_BINARY_RESOLVER_REPO_ROOT"] =
+        runtime.fetch("trusted_env").fetch("HOMEBREW_KANDELO_ROOT")
     end
   end
 
@@ -1140,6 +1279,40 @@ module KandeloFormulaSupport
     system kandelo_host_tool("bash"), "-c", command
   end
 
+  def kandelo_formula_checker_path
+    KANDELO_TIER2_RUNTIME.fetch("formula_checker_path")
+  end
+
+  def kandelo_formula_binary_cache_root
+    KANDELO_TIER2_RUNTIME.fetch("formula_binary_cache_root")
+  end
+
+  def kandelo_formula_resolver_repo_root
+    KANDELO_TIER2_RUNTIME.fetch("trusted_env").fetch("HOMEBREW_KANDELO_ROOT")
+  end
+
+  def kandelo_node_runner_environment
+    checker = kandelo_formula_checker_path
+    return "" if checker.nil?
+
+    binary_cache_root = kandelo_formula_binary_cache_root
+    resolver_repo_root = kandelo_formula_resolver_repo_root
+    if binary_cache_root.nil? || resolver_repo_root.to_s.empty?
+      odie "sealed Kandelo Formula runner authority is incomplete"
+    end
+
+    # WHY: Homebrew preserves HOMEBREW_* variables when it re-execs Formula
+    # tests but removes the resolver's ordinary variables. The support loader
+    # validates and freezes one source root, checker, and transported package
+    # cache before Formula code runs. Restoring that exact set keeps binaries/
+    # links bound to their complete content-addressed package generations.
+    [
+      "WASM_POSIX_BINARY_CACHE_ROOT=#{Shellwords.escape(binary_cache_root)}",
+      "WASM_POSIX_BINARY_RESOLVER_REPO_ROOT=#{Shellwords.escape(resolver_repo_root)}",
+      "WASM_POSIX_XTASK_BIN=#{Shellwords.escape(checker)}",
+    ].join(" ") << " "
+  end
+
   # Run a built `.wasm` under the Node kernel host and return its stdout. The
   # guest inherits the passed `env:`, matching how a real `brew test` exercises
   # behavior. `network: true` opts into Node's real external-TCP backend, while
@@ -1229,6 +1402,7 @@ module KandeloFormulaSupport
       env.each { |key, value| command << "#{key}=#{Shellwords.escape(value.to_s)} " }
     end
     command << "KANDELO_GUEST_OUTPUT_FILE=#{Shellwords.escape(guest_output_path.to_s)} " if guest_output_path
+    command << kandelo_node_runner_environment
     command << "node --experimental-wasm-exnref --import tsx/esm "
     if isolated_runner
       runner = Pathname(__dir__)/"run-network-wasm.ts"
@@ -1303,6 +1477,7 @@ module KandeloFormulaSupport
     guest_env = JSON.generate(env.transform_values(&:to_s))
     runner = Pathname(__dir__)/"run-http-service-wasm.ts"
     command = "cd #{Shellwords.escape(root)} && "
+    command << kandelo_node_runner_environment
     command << "KANDELO_FORMULA_HTTP_SERVICE_JSON=#{Shellwords.escape(spec)} "
     command << "KANDELO_FORMULA_GUEST_ENV_JSON=#{Shellwords.escape(guest_env)} "
     command << "node --experimental-wasm-exnref --import tsx/esm "
@@ -1404,6 +1579,7 @@ module KandeloFormulaSupport
       config_file.flush
 
       invocation = "cd #{Shellwords.escape(root)} && "
+      invocation << kandelo_node_runner_environment
       invocation << "KANDELO_FORMULA_PTY_CONFIG_PATH=#{Shellwords.escape(config_file.path)} "
       invocation << command
 
@@ -1449,7 +1625,9 @@ module KandeloFormulaSupport
       "node", "--experimental-wasm-exnref", "--import", "tsx/esm",
       runner, root, wasm_path, JSON.generate(argv.map(&:to_s)), min_page_flips, timeout_ms
     ].map { |arg| Shellwords.escape(arg.to_s) }.join(" ")
-    output = shell_output("cd #{Shellwords.escape(root)} && #{command} < /dev/null")
+    output = shell_output(
+      "cd #{Shellwords.escape(root)} && #{kandelo_node_runner_environment}#{command} < /dev/null",
+    )
     kandelo_record_node_execution!(wasm_path, argv, launcher: "kandelo_run_kms_wasm")
     output
   end
@@ -1480,7 +1658,9 @@ module KandeloFormulaSupport
       runner, root, Pathname(bin_path), config
     ].map { |arg| Shellwords.escape(arg.to_s) }.join(" ")
 
-    shell_output("cd #{Shellwords.escape(root)} && #{command} < /dev/null")
+    shell_output(
+      "cd #{Shellwords.escape(root)} && #{kandelo_node_runner_environment}#{command} < /dev/null",
+    )
   end
 
   # Run a formula executable through Kandelo's Chromium browser host. This is
@@ -1544,7 +1724,9 @@ module KandeloFormulaSupport
       runner, root, wasm_path, config, guest_files_manifest, exec_programs_manifest
     ].map { |arg| Shellwords.escape(arg.to_s) }.join(" ")
 
-    shell_output("cd #{Shellwords.escape(root)} && #{command} < /dev/null")
+    shell_output(
+      "cd #{Shellwords.escape(root)} && #{kandelo_node_runner_environment}#{command} < /dev/null",
+    )
   end
 
   # Run a framebuffer program through Kandelo's browser host and require
@@ -1580,7 +1762,9 @@ module KandeloFormulaSupport
       runner, root, wasm_path, config
     ].map { |arg| Shellwords.escape(arg.to_s) }.join(" ")
 
-    shell_output("cd #{Shellwords.escape(root)} && #{command} < /dev/null")
+    shell_output(
+      "cd #{Shellwords.escape(root)} && #{kandelo_node_runner_environment}#{command} < /dev/null",
+    )
   end
 
   def kandelo_record_node_execution!(wasm_path, argv, launcher: "kandelo_run_wasm")

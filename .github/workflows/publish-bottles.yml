@@ -10,13 +10,15 @@ jobs:
       actions: read
       contents: write
       packages: write
-    uses: Automattic/kandelo/.github/workflows/reusable-homebrew-bottle-publish.yml@466a685d9366d3b712c4fe998307e00157bd5d15
+    uses: Automattic/kandelo/.github/workflows/reusable-homebrew-bottle-publish.yml@3545bfd34509a52b68a4620c92e4aae24c60adb0
     with:
       kandelo-repository: Automattic/kandelo
-      kandelo-ref: main
+      kandelo-ref: 3545bfd34509a52b68a4620c92e4aae24c60adb0
       tap-repository: brandonpayton/homebrew-kandelo-canary
       tap-name: brandonpayton/kandelo-canary
-      tap-ref: main
+      # WHY: repository_dispatch loads this caller from main, but Formula
+      # source must remain the exact reviewed snapshot selected for the proof.
+      tap-ref: ${{ github.event.client_payload.tap_sha }}
       formulae: ${{ github.event.client_payload.formulae }}
       arches: ${{ github.event.client_payload.arches || 'wasm32' }}
       release-tag: ${{ github.event.client_payload.release_tag || '' }}
@@ -24,3 +26,10 @@ jobs:
       force: ${{ github.event.client_payload.force || false }}
       dry-run: false
       require-vfs-acceptance: ${{ github.event.client_payload.require_vfs_acceptance || false }}
+      # WHY: ABI 42's package archives were produced immediately before the
+      # publisher bridge. The bridge proves this sealed generation is an exact
+      # ancestor with the same rootfs closure instead of rebuilding from a
+      # mutable release index.
+      prepublication-staging-tag: pr-1079-staging
+      prepublication-staging-kandelo-sha: 437fde2524ea6ad9c44933f8abbf995a46841009
+      defer-vfs-acceptance-until-postpublication: ${{ github.event.client_payload.require_vfs_acceptance || false }}
