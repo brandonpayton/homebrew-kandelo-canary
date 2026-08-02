@@ -1925,20 +1925,29 @@ class KandeloFormulaSupportTest < Minitest::Test
     ENV.replace(original) if original
   end
 
-  def test_canary_m4_loads_local_support_and_uses_the_locked_core_dependency
-    formula = File.read(File.expand_path("../../../Formula/m4.rb", __dir__))
+  def test_canary_formulae_load_local_support_and_the_locked_core_dependency
     dependency_taps = JSON.parse(
       File.read(File.expand_path("../../dependency-taps.json", __dir__)),
     )
     support_require = 'require (Tap.fetch("brandonpayton", "kandelo-canary").path/' \
                       '"Kandelo/formula_support/kandelo_formula_support").to_s'
 
-    assert_includes formula.lines, "#{support_require}\n"
-    assert_includes formula,
-                    "  depends_on KandeloFormulaSupport::BinaryenRequirement => :build\n"
-    assert_includes formula,
-                    "  depends_on KandeloFormulaSupport::WabtRequirement => :build\n"
-    assert_includes formula, %(  depends_on "kandelo-dev/tap-core/dash"\n)
+    %w[m4 m4-canary].each do |name|
+      formula = File.read(
+        File.expand_path("../../../Formula/#{name}.rb", __dir__),
+      )
+      assert_includes formula.lines, "#{support_require}\n"
+      assert_includes formula,
+                      "  depends_on KandeloFormulaSupport::BinaryenRequirement => :build\n"
+      assert_includes formula,
+                      "  depends_on KandeloFormulaSupport::WabtRequirement => :build\n"
+      assert_includes formula, %Q(  depends_on "kandelo-dev/tap-core/dash"\n)
+    end
+    canary = File.read(
+      File.expand_path("../../../Formula/m4-canary.rb", __dir__),
+    )
+    assert_includes canary,
+                    %Q(  keg_only "it is an independent third-party installation canary"\n)
     assert_equal [
       {
         "tap_name"       => "kandelo-dev/tap-core",

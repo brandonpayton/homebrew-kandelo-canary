@@ -65,12 +65,23 @@ package to this public source repository; shortening the destination to
 `kandelo-canary/m4` exercises a different package-creation path and is not
 this canary.
 
+## In-guest installation canary
+
+`m4-canary` has a distinct Homebrew identity so a Kandelo guest can install
+it beside the core tap's precomposed `m4`. It remains keg-only because both
+Formulae provide a program named `m4`; callers can run the independent copy
+from `$(brew --prefix brandonpayton/kandelo-canary/m4-canary)/bin/m4`.
+
+This avoids making the third-party installation proof depend on first
+uninstalling core M4. Uninstalling an Info-page-bearing keg correctly requires
+the separate `install-info` runtime tool, which is outside this canary's
+package closure.
+
 ## Maintainer procedure
 
-`m4` is the smallest dependency-bearing proof in this canary. Its Formula
-truthfully uses the core tap's `dash` as the configured runtime shell. This
-write must produce cross-tap closure evidence and boot the composed VFS image
-under both supported hosts:
+`m4-canary` is the smallest dependency-bearing guest-install proof in this
+tap. Its Formula truthfully uses the core tap's `dash` as the configured
+runtime shell. Publish it from an exact reviewed tap commit:
 
 ```bash
 CANARY_TAP_SHA="$(gh api \
@@ -78,10 +89,9 @@ CANARY_TAP_SHA="$(gh api \
   --jq '.sha')"
 gh api -X POST repos/brandonpayton/homebrew-kandelo-canary/dispatches \
   -f event_type=publish-kandelo-bottles \
-  -f 'client_payload[formulae]=m4' \
+  -f 'client_payload[formulae]=m4-canary' \
   -f 'client_payload[arches]=wasm32' \
-  -f "client_payload[tap_sha]=${CANARY_TAP_SHA}" \
-  -F 'client_payload[require_vfs_acceptance]=true'
+  -f "client_payload[tap_sha]=${CANARY_TAP_SHA}"
 ```
 
 The exact `tap_sha` binds publication to the reviewed Formula snapshot even if
@@ -90,9 +100,8 @@ the default branch advances before the run starts.
 The write workflow contains the same pre-upload planning, build, and local
 handoff validation as the dry-run workflow. It additionally exercises the
 critical behavior a dry run cannot test: public package creation followed by
-credential-free digest readback. The completed run also proves cross-tap VFS
-composition and immutable release publication, so the earlier single-package
-pilot is no longer part of the active canary.
+credential-free digest readback. Kandelo's guest lifecycle then owns the
+cross-tap install and execution proof in Node and Chromium.
 
 Do not add `HOMEBREW_GITHUB_PACKAGES_TOKEN` or another package secret. The
 caller grants a permission ceiling of `actions: read`, `contents: write`, and
