@@ -4,7 +4,7 @@
     {
       "tap_name": "kandelo-dev/tap-core",
       "tap_repository": "kandelo-dev/homebrew-tap-core",
-      "tap_commit": "e181383af916ab3f55882ea31f6b61acfd2fe6de"
+      "tap_commit": "4a786fc4915f71d07bdab9a7f98f88e7a56e02d6"
     }
   ]
 }
