@@ -1,8 +1,8 @@
 {
   "schema": 2,
-  "formula": "m4",
+  "formula": "m4-canary",
   "brewfile": "Kandelo/vfs-acceptance.Brewfile",
-  "executable": "/home/linuxbrew/.linuxbrew/bin/m4",
+  "executable": "/opt/kandelo/homebrew/opt/m4-canary/bin/m4",
   "argv": ["m4", "--version"],
   "expected_stdout": "GNU M4) 1.4.21",
   "shell_config": "Kandelo/vfs-acceptance-shell.json"

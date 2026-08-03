@@ -1,2 +1,2 @@
 tap "brandonpayton/kandelo-canary"
-brew "brandonpayton/kandelo-canary/m4"
+brew "brandonpayton/kandelo-canary/m4-canary"
