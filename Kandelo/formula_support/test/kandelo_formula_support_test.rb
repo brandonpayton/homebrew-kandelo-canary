@@ -26,6 +26,11 @@ class KandeloFormulaSupportTest < Minitest::Test
   InstalledFormula = Struct.new(:rack, :pkg_version, keyword_init: true)
   StableSpec = Struct.new(:url, :checksum, keyword_init: true)
   StableChecksum = Struct.new(:hexdigest, keyword_init: true)
+  StagedResource = Struct.new(:url, :checksum, :source, keyword_init: true) do
+    def stage
+      Dir.chdir(source) { yield }
+    end
+  end
 
   NATIVE_REQUIREMENT_IDENTITIES = {
     KandeloFormulaSupport::BinaryenRequirement => ["binaryen", "wasm-opt"],
@@ -33,7 +38,7 @@ class KandeloFormulaSupportTest < Minitest::Test
     KandeloFormulaSupport::WabtRequirement     => ["wabt", "wasm-validate"],
   }.freeze
   CANARY_NATIVE_REQUIREMENTS = %w[BinaryenRequirement WabtRequirement].freeze
-  REVIEWED_CORE_TAP_COMMIT = "28ffdfa6261c82acb77cab8b1608267f9ba884c6"
+  REVIEWED_CORE_TAP_COMMIT = "e181383af916ab3f55882ea31f6b61acfd2fe6de"
 
   def test_native_requirements_have_the_closed_publisher_identity
     support = Pathname(__dir__).join("..", "kandelo_formula_support.rb").binread
@@ -93,6 +98,31 @@ class KandeloFormulaSupportTest < Minitest::Test
     assert_equal CANARY_NATIVE_REQUIREMENTS, used.uniq.sort
   end
 
+  def test_fork_instrumented_formulae_delegate_fork_import_validation_to_shared_contract
+    formula_dir = Pathname(__dir__).join("../../..", "Formula").cleanpath
+    offenders = formula_dir.glob("*.rb").sort.filter_map do |path|
+      source = path.binread
+      instrumentation = source.index("kandelo_fork_instrument")
+      next if instrumentation.nil?
+
+      # WHY: non-ABI import audits remain useful before instrumentation, but
+      # imports added afterward belong to Kandelo's generated fork contract.
+      # Parsing them here or spelling their names in a Formula can drift from
+      # the shared structural validator whenever that contract changes.
+      after_instrumentation = source.byteslice(instrumentation..)
+      formula_owns_fork_imports =
+        after_instrumentation.include?("<- env") ||
+        source.match?(/\b__wpk_fork_[A-Za-z0-9_]*\b/)
+      path.basename.to_s if formula_owns_fork_imports
+    end
+
+    assert_empty(
+      offenders,
+      "fork-instrumented Formulae must delegate fork-import validation " \
+      "to kandelo_validate_wasm_artifact",
+    )
+  end
+
   # Minimal Formula double for command-construction tests.
   class Harness
     include KandeloFormulaSupport
@@ -101,7 +131,7 @@ class KandeloFormulaSupportTest < Minitest::Test
                   :formula_version, :formula_binary_cache_root, :formula_checker_path,
                   :formula_resolver_repo_root, :homebrew_prefix_path, :nix_path, :prefix_path,
                   :root_path, :runtime_formulae, :shell_result, :stable_spec, :test_path,
-                  :tier2_runtime
+                  :tier2_runtime, :resources
     attr_reader :command, :expected_status, :pty_config, :pty_config_mode, :pty_config_path,
                 :recorded_launcher, :system_args, :system_calls, :system_environment
 
@@ -138,6 +168,10 @@ class KandeloFormulaSupportTest < Minitest::Test
         url: "https://example.test/test-formula-1.0.tar.gz",
         checksum: StableChecksum.new(hexdigest: "a" * 64),
       )
+    end
+
+    def resource(resource_name)
+      resources.fetch(resource_name)
     end
 
     def kandelo_tier2_runtime!
@@ -304,21 +338,59 @@ class KandeloFormulaSupportTest < Minitest::Test
       support_path = tap_root/"Kandelo/formula_support/kandelo_formula_support.rb"
       formula_path = tap_root/"Formula/hello.rb"
       prefix = base/"prefix"
+      protected_anchor = base/"protected-anchor"
+      protected_root = protected_anchor/"build-#{"a" * 64}"
+      recipe_runner = protected_root/"homebrew-tap-recipe-runner"
+      sealed_root = protected_root/"sealed-outputs"
       root = base/root_basename
       sysroot = root/"sysroot"
-      [support_path.dirname, formula_path.dirname, prefix, sysroot].each(&:mkpath)
+      tool_dir = root/"tools/bin"
+      fork_instrument = tool_dir/"wasm-fork-instrument"
+      local_root_spill = tool_dir/"wasm-local-root-spill"
+      [
+        support_path.dirname, formula_path.dirname, prefix, protected_anchor,
+        protected_root,
+        sealed_root, sysroot, tool_dir,
+      ].each(&:mkpath)
+      protected_anchor.chmod(0711)
+      sealed_root.chmod(0555)
+      [fork_instrument, local_root_spill, recipe_runner].each do |tool|
+        tool.binwrite("#!/bin/sh\nexit 0\n")
+        tool.chmod(0555)
+      end
+      protected_root.chmod(0555)
       FileUtils.cp(File.expand_path("../kandelo_formula_support.rb", __dir__), support_path)
+      support_source = support_path.binread.sub(
+        '"/run/kandelo-homebrew-publisher".freeze',
+        "#{protected_anchor.to_s.inspect}.freeze",
+      )
+      support_path.binwrite(support_source)
       formula_path.binwrite("class Hello < Formula\nend\n")
-      yield({
-        base:,
-        formula_path:,
-        prefix:,
-        root:,
-        support_path:,
-        sysroot:,
-        tap_name:,
-        tap_root:,
-      })
+      begin
+        yield({
+          base:,
+          fork_instrument:,
+          formula_path:,
+          local_root_spill:,
+          prefix:,
+          protected_anchor:,
+          protected_root:,
+          recipe_runner:,
+          root:,
+          sealed_root:,
+          support_path:,
+          sysroot:,
+          tap_name:,
+          tap_root:,
+        })
+      ensure
+        if protected_anchor.exist?
+          protected_anchor.chmod(0755)
+          protected_anchor.find do |entry|
+            entry.chmod(0755) unless entry.symlink?
+          end
+        end
+      end
     end
   end
 
@@ -337,8 +409,10 @@ class KandeloFormulaSupportTest < Minitest::Test
     cache_root
   end
 
-  def tier2_loader_attestation(fixture, bridge: true)
-    nested = if bridge
+  def tier2_loader_attestation(fixture, bridge: true, recipe: false)
+    raise "loader fixture cannot authorize two build paths" if bridge && recipe
+
+    nested_bridge = if bridge
       {
         "build_toml_sha256"   => "b" * 64,
         "package"             => "hello",
@@ -352,8 +426,22 @@ class KandeloFormulaSupportTest < Minitest::Test
         "version"             => "1.0",
       }
     end
-    {
-      "schema"                 => 2,
+    nested_recipe = if recipe
+      {
+        "dependencies"     => ["kandelo-dev/tap-core/zlib"],
+        "entrypoint"        => "build.sh",
+        "file_count"        => 1,
+        "manifest_sha256"   => "b" * 64,
+        "resources"         => [],
+        "script_env_keys"   => ["HELLO_VALUE"],
+        "source_sha256"     => "e" * 64,
+        "source_url"        => "https://example.test/hello-1.0.tar.gz",
+        "total_bytes"       => 32,
+        "version"           => "1.0",
+      }
+    end
+    document = {
+      "schema"                 => recipe ? 3 : 2,
       "arch"                   => "wasm32",
       "tap"                    => fixture.fetch(:tap_name),
       "formula"                => "hello",
@@ -361,8 +449,10 @@ class KandeloFormulaSupportTest < Minitest::Test
       "formula_sha256"         => Digest::SHA256.file(fixture.fetch(:formula_path)).hexdigest,
       "support_runtime_sha256" => support_runtime_sha256(fixture.fetch(:support_path).dirname),
       "support_sha256"         => Digest::SHA256.file(fixture.fetch(:support_path)).hexdigest,
-      "tier2_bridge"           => nested,
+      "tier2_bridge"           => nested_bridge,
     }
+    document["tap_recipe"] = nested_recipe if recipe
+    document
   end
 
   def support_runtime_sha256(support_dir)
@@ -389,9 +479,13 @@ class KandeloFormulaSupportTest < Minitest::Test
     env = {
       "HOMEBREW_PREFIX"                 => fixture.fetch(:prefix).to_s,
       "HOMEBREW_KANDELO_ARCH"           => "wasm32",
+      "HOMEBREW_KANDELO_FORK_INSTRUMENT" => fixture.fetch(:fork_instrument).to_s,
+      "HOMEBREW_KANDELO_LOCAL_ROOT_SPILL" => fixture.fetch(:local_root_spill).to_s,
       "HOMEBREW_KANDELO_PRIMARY_TAP_ROOT" => fixture.fetch(:tap_root).to_s,
       "HOMEBREW_KANDELO_ROOT"           => fixture.fetch(:root).to_s,
       "HOMEBREW_KANDELO_SYSROOT"        => fixture.fetch(:sysroot).to_s,
+      "HOMEBREW_KANDELO_TAP_RECIPE_RUNNER" => fixture.fetch(:recipe_runner).to_s,
+      "HOMEBREW_KANDELO_TAP_RECIPE_SEALED_ROOT" => fixture.fetch(:sealed_root).to_s,
       "KANDELO_HOMEBREW_ARCH"           => "wasm32",
       "KANDELO_HOMEBREW_KANDELO_ROOT"   => fixture.fetch(:root).to_s,
       "WASM_POSIX_SYSROOT"              => fixture.fetch(:sysroot).to_s,
@@ -404,6 +498,7 @@ class KandeloFormulaSupportTest < Minitest::Test
           [
             "class File::Stat",
             "  def uid = #{Integer(simulated_owner_uid)}",
+            "  def gid = 0",
             "end",
           ]
         end
@@ -557,6 +652,374 @@ class KandeloFormulaSupportTest < Minitest::Test
     ENV.replace(original) if original
   end
 
+  def set_tap_recipe_fixture_seal!(tap_root, sealed:)
+    directories = []
+    tap_root.find do |entry|
+      stat = entry.lstat
+      next if stat.symlink?
+
+      if stat.directory?
+        directories << entry
+      elsif stat.file?
+        executable = (stat.mode & 0111).positive?
+        entry.chmod(
+          if sealed
+            executable ? 0555 : 0444
+          else
+            executable ? 0755 : 0644
+          end,
+        )
+      end
+    end
+    directory_mode = sealed ? 0555 : 0755
+    directories.reverse_each { |directory| directory.chmod(directory_mode) }
+  end
+
+  def mutate_sealed_tap_recipe_fixture!(fixture)
+    tap_root = fixture.fetch(:tap_root)
+    set_tap_recipe_fixture_seal!(tap_root, sealed: false)
+    yield
+  ensure
+    set_tap_recipe_fixture_seal!(tap_root, sealed: true) if tap_root&.exist?
+  end
+
+  def with_tap_recipe_build_fixture(
+    script_env: nil, formula_name: "hello", resource_records: []
+  )
+    original = ENV.to_hash
+    Dir.mktmpdir("kandelo-tap-recipe-build") do |dir|
+      base = Pathname(dir).realpath
+      tap_root = base/"kandelo-dev/homebrew-tap-core"
+      recipe_root = tap_root/"Kandelo/recipes"/formula_name
+      support_path = tap_root/"Kandelo/formula_support/kandelo_formula_support.rb"
+      formula_path = tap_root/"Formula/#{formula_name}.rb"
+      root = base/"kandelo-root"
+      protected_root = base/"protected"
+      recipe_runner = protected_root/"homebrew-tap-recipe-runner"
+      sealed_root = protected_root/"sealed-outputs"
+      sysroot = root/"sysroot"
+      tool_dir = root/"tools/bin"
+      fork_instrument = tool_dir/"wasm-fork-instrument"
+      local_root_spill = tool_dir/"wasm-local-root-spill"
+      build_path = base/"formula-build"
+      prefix_path = base/"formula-prefix"
+      runner_output = base/"recipe-service-output"
+      [
+        recipe_root/"patches", support_path.dirname, formula_path.dirname,
+        protected_root, sealed_root, sysroot, tool_dir, build_path,
+      ].each(&:mkpath)
+      [fork_instrument, local_root_spill, recipe_runner].each do |tool|
+        tool.binwrite("#!/bin/sh\nexit 0\n")
+        tool.chmod(0555)
+      end
+      FileUtils.cp(File.expand_path("../kandelo_formula_support.rb", __dir__), support_path)
+      formula_path.binwrite("class Hello < Formula\nend\n")
+      (build_path/"upstream.c").binwrite("int main(void) { return 0; }\n")
+
+      entrypoint = recipe_root/"build.sh"
+      patch = recipe_root/"patches/config.patch"
+      entrypoint.binwrite("#!/usr/bin/env bash\nset -euo pipefail\n")
+      entrypoint.chmod(0755)
+      patch.binwrite("--- a/configure\n+++ b/configure\n")
+      records = [entrypoint, patch].map do |path|
+        relative = path.relative_path_from(recipe_root).to_s
+        contents = path.binread
+        {
+          "bytes"  => contents.bytesize,
+          "mode"   => (path.stat.mode & 0111).positive? ? "0755" : "0644",
+          "path"   => relative,
+          "sha256" => Digest::SHA256.hexdigest(contents),
+        }
+      end.sort_by { |record| record.fetch("path") }
+      manifest = {
+        "schema"       => 1,
+        "dependencies" => ["kandelo-dev/tap-core/zlib"],
+        "entrypoint"   => "build.sh",
+        "files"        => records,
+      }
+      manifest_path = recipe_root/"recipe.json"
+      manifest_path.binwrite("#{JSON.pretty_generate(manifest)}\n")
+
+      script_env ||= { "HELLO_VALUE" => "attested-value" }
+      recipe = {
+        "dependencies"     => manifest.fetch("dependencies"),
+        "entrypoint"        => manifest.fetch("entrypoint"),
+        "file_count"        => records.length,
+        "manifest_sha256"   => Digest::SHA256.file(manifest_path).hexdigest,
+        "resources"         => resource_records,
+        "script_env_keys"   => script_env.keys.sort,
+        "source_sha256"     => "a" * 64,
+        "source_url"        => "https://example.test/hello-1.0.tar.gz",
+        "total_bytes"       => records.sum { |record| record.fetch("bytes") },
+        "version"           => "1.0",
+      }
+      attestation = {
+        "schema"                 => 3,
+        "arch"                   => "wasm32",
+        "tap"                    => "kandelo-dev/tap-core",
+        "formula"                => formula_name,
+        "full_name"              => "kandelo-dev/tap-core/#{formula_name}",
+        "formula_sha256"         => Digest::SHA256.file(formula_path).hexdigest,
+        "support_runtime_sha256" => support_runtime_sha256(support_path.dirname),
+        "support_sha256"         => Digest::SHA256.file(support_path).hexdigest,
+        "tap_recipe"             => recipe,
+        "tier2_bridge"           => nil,
+      }
+      trusted_env =
+        KandeloFormulaSupport::KANDELO_TIER2_TRUSTED_ENV_KEYS.to_h { |key| [key, nil] }
+      trusted_env.merge!({
+        "HOMEBREW_KANDELO_ARCH"             => "wasm32",
+        "HOMEBREW_KANDELO_FORK_INSTRUMENT"  => fork_instrument.to_s,
+        "HOMEBREW_KANDELO_LOCAL_ROOT_SPILL" => local_root_spill.to_s,
+        "HOMEBREW_KANDELO_PRIMARY_TAP_ROOT" => tap_root.to_s,
+        "HOMEBREW_KANDELO_ROOT"             => root.to_s,
+        "HOMEBREW_KANDELO_SYSROOT"          => sysroot.to_s,
+        "HOMEBREW_KANDELO_TAP_RECIPE_RUNNER" => recipe_runner.to_s,
+        "HOMEBREW_KANDELO_TAP_RECIPE_SEALED_ROOT" => sealed_root.to_s,
+        "HOMEBREW_KANDELO_XTASK_BIN"        => "/must/not/reach/recipe",
+        "KANDELO_HOMEBREW_ARCH"             => "wasm32",
+        "KANDELO_HOMEBREW_KANDELO_ROOT"     => root.to_s,
+        "WASM_POSIX_SYSROOT"                => sysroot.to_s,
+      })
+      runtime = {
+        "attestation"               => attestation,
+        "attestation_path"          => (base/"attestation.json").to_s,
+        "formula_binary_cache_root" => (root/".ci-test-binary-cache").to_s,
+        "formula_checker_path"      => "/must/not/reach/recipe",
+        "formula_path"              => formula_path.to_s,
+        "support_path"              => support_path.to_s,
+        "support_runtime_sha256"    => attestation.fetch("support_runtime_sha256"),
+        "support_sha256"            => attestation.fetch("support_sha256"),
+        "tap_recipe_runner_path"    => recipe_runner.to_s,
+        "tap_recipe_runner_uid"     => Process.uid,
+        "tap_recipe_sealed_root"    => sealed_root.to_s,
+        "tap_recipe_tools"          => {
+          "fork_instrument"  => fork_instrument.to_s,
+          "local_root_spill" => local_root_spill.to_s,
+        },
+        "trusted_env"               => trusted_env,
+      }
+
+      dependency_name = recipe.fetch("dependencies").first
+      dependency_rack = base/"Cellar/zlib"
+      dependency_keg = dependency_rack/"1.3.1"
+      (dependency_keg/"lib").mkpath
+      dependency_formula = DependencyFormula.new(
+        full_name: dependency_name,
+        opt_bin: dependency_keg/"bin",
+        opt_sbin: dependency_keg/"sbin",
+        opt_libexec: dependency_keg/"libexec",
+      )
+      activation_calls = []
+      runner_requests = []
+      runner_return_hooks = []
+      system_hooks = []
+      harness = Harness.new
+      harness.build_path = build_path
+      harness.dependency_formulae = {
+        dependency_name => InstalledFormula.new(rack: dependency_rack, pkg_version: "1.3.1"),
+      }
+      harness.formula_name = formula_name
+      harness.formula_full_name = "kandelo-dev/tap-core/#{formula_name}"
+      harness.formula_path = formula_path
+      harness.formula_version = "1.0"
+      harness.prefix_path = prefix_path
+      harness.root_path = root.to_s
+      harness.runtime_formulae = [dependency_formula]
+      harness.resources = resource_records.to_h do |resource_record|
+        resource_name = resource_record.fetch("name")
+        staged_source = base/"resource-sources"/resource_name
+        staged_source.mkpath
+        (staged_source/"input.txt").binwrite("verified #{resource_name} resource\n")
+        [
+          resource_name,
+          StagedResource.new(
+            url: resource_record.fetch("source_url"),
+            checksum: StableChecksum.new(
+              hexdigest: resource_record.fetch("source_sha256"),
+            ),
+            source: staged_source,
+          ),
+        ]
+      end
+      harness.stable_spec = StableSpec.new(
+        url: recipe.fetch("source_url"),
+        checksum: StableChecksum.new(hexdigest: recipe.fetch("source_sha256")),
+      )
+      harness.define_singleton_method(:kandelo_tap_recipe_runtime!) { [runtime, recipe] }
+      harness.define_singleton_method(:kandelo_activate_sdk!) do
+        activation_calls << :sdk
+        raise "registry checker leaked into tap recipe" if ENV.key?("HOMEBREW_KANDELO_XTASK_BIN")
+        raise "registry cache leaked into tap recipe" if ENV.key?("WASM_POSIX_BINARY_CACHE_ROOT")
+
+        ENV["WASM_POSIX_XTASK_BIN"] = "/sdk/attempted-resolver-authority"
+        root.to_s
+      end
+      harness.define_singleton_method(:kandelo_activate_sysroot!) do |activated_root|
+        activation_calls << :sysroot
+        raise "wrong activation root" unless activated_root == root.to_s
+
+        ENV["WASM_POSIX_SYSROOT"] = sysroot.to_s
+        activated_root
+      end
+      harness.define_singleton_method(:system) do |*args|
+        Harness.instance_method(:system).bind_call(self, *args)
+        unless args.length == 5 && args.fetch(0) == recipe_runner.to_s &&
+               args.fetch(1) == "--request" && args.fetch(3) == "--response"
+          raise "unexpected tap recipe runner invocation: #{args.inspect}"
+        end
+        request_path = Pathname(args.fetch(2))
+        response_path = Pathname(args.fetch(4))
+        request_bytes = request_path.binread
+        request = JSON.parse(request_bytes)
+        runner_requests << request
+        out_dir = Pathname(request.fetch("output_root"))
+        # Model the real runner's mount namespace: the recipe writes to its
+        # private output view, while the Formula-owned host path stays empty.
+        (runner_output/"bin").mkpath
+        (runner_output/"lib").mkpath
+        (runner_output/"libexec/tools").mkpath
+        (runner_output/"share/hello").mkpath
+        (runner_output/"bin/hello").binwrite("tap recipe output\n")
+        (runner_output/"bin/hello").chmod(0755)
+        (runner_output/"bin/readme.txt").binwrite("non-executable bin data\n")
+        (runner_output/"libexec/tools/helper").binwrite("nested helper\n")
+        (runner_output/"libexec/tools/helper").chmod(0755)
+        (runner_output/"lib/libhello.a").binwrite("archive payload\n")
+        (runner_output/"share/hello/data.txt").binwrite("nested data\n")
+        (runner_output/"share/hello/run-helper").binwrite(
+          "executable shared helper\n",
+        )
+        (runner_output/"share/hello/run-helper").chmod(0755)
+        (runner_output/"bin/hello-current").make_symlink(
+          "../libexec/tools/helper",
+        )
+        system_hooks.each(&:call)
+        unless out_dir.directory? && out_dir.children.empty?
+          raise "runner changed the Formula-owned host output root"
+        end
+        kandelo_validate_tap_recipe_output!(runner_output)
+
+        request_sha256 = Digest::SHA256.hexdigest(request_bytes)
+        sealed_out = sealed_root/"output-#{request_sha256.slice(0, 16)}"
+        sealed_out.mkdir
+        FileUtils.cp_r(runner_output.children, sealed_out)
+        sealed_directories = []
+        sealed_out.find do |entry|
+          stat = entry.lstat
+          if stat.directory? && !stat.symlink?
+            sealed_directories << entry
+          elsif stat.file? && !stat.symlink?
+            entry.chmod((stat.mode & 0111).zero? ? 0444 : 0555)
+          end
+        end
+        sealed_directories.reverse_each { |directory| directory.chmod(0555) }
+        evidence = kandelo_validate_tap_recipe_output!(
+          sealed_out, expected_uid: Process.uid, sealed: true
+        )
+        response_path.binwrite(JSON.generate({
+          "entry_count"            => evidence.fetch("entry_count"),
+          "output_manifest_sha256" => evidence.fetch("output_manifest_sha256"),
+          "request_sha256"         => request_sha256,
+          "schema"                 => 1,
+          "sealed_output_root"     => sealed_out.to_s,
+          "total_bytes"            => evidence.fetch("total_bytes"),
+        }))
+        response_path.chmod(0444)
+        runner_return_hooks.each { |hook| hook.call(sealed_out, response_path) }
+        # Match Homebrew's Formula#system contract: it raises on failure and
+        # returns nil after a successful command.
+        nil
+      end
+
+      # Match the launcher boundary exactly: every overlay directory is 0555,
+      # executable files are 0555, and data files are 0444 before Formula code
+      # receives the protected primary-tap path.
+      set_tap_recipe_fixture_seal!(tap_root, sealed: true)
+      begin
+        yield({
+          activation_calls:,
+          build_path:,
+          dependency_keg:,
+          entrypoint:,
+          fork_instrument:,
+          formula_path:,
+          harness:,
+          manifest_path:,
+          local_root_spill:,
+          patch:,
+          prefix_path:,
+          recipe:,
+          recipe_runner:,
+          recipe_root:,
+          root:,
+          runner_requests:,
+          runner_return_hooks:,
+          runner_output:,
+          sealed_root:,
+          script_env:,
+          support_path:,
+          system_hooks:,
+          tap_root:,
+        })
+      ensure
+        set_tap_recipe_fixture_seal!(tap_root, sealed: false) if tap_root.exist?
+        if sealed_root.exist?
+          sealed_root.find do |entry|
+            entry.chmod(0755) unless entry.symlink?
+          end
+        end
+      end
+    end
+  ensure
+    ENV.replace(original) if original
+  end
+
+  def assert_tap_recipe_rejected_before_activation(
+    fixture,
+    resources: fixture.fetch(:recipe).fetch("resources").map { |record| record.fetch("name") },
+    script_env: fixture.fetch(:script_env)
+  )
+    error = assert_raises(RuntimeError) do
+      fixture.fetch(:harness).kandelo_build_tap_recipe(
+        manifest_sha256: fixture.fetch(:recipe).fetch("manifest_sha256"),
+        resources:,
+        script_env:,
+      )
+    end
+    assert_empty fixture.fetch(:activation_calls)
+    assert_nil fixture.fetch(:harness).system_calls
+    assert_path_exists fixture.fetch(:build_path)/"upstream.c"
+    refute_path_exists fixture.fetch(:build_path)/"kandelo-package-source"
+    error
+  end
+
+  def run_tap_recipe(
+    fixture,
+    resources: fixture.fetch(:recipe).fetch("resources").map { |record| record.fetch("name") },
+    script_env: fixture.fetch(:script_env)
+  )
+    fixture.fetch(:harness).kandelo_build_tap_recipe(
+      manifest_sha256: fixture.fetch(:recipe).fetch("manifest_sha256"),
+      resources:,
+      script_env:,
+    )
+  end
+
+  def tap_recipe_tree_snapshot(root)
+    root.find.map do |entry|
+      stat = entry.lstat
+      relative = entry.relative_path_from(root).to_s
+      payload =
+        if stat.file? && !stat.symlink?
+          entry.binread
+        elsif stat.symlink?
+          entry.readlink.to_s
+        end
+      [relative, stat.ftype, stat.mode & 07777, stat.uid, stat.gid, payload]
+    end.sort_by(&:first)
+  end
+
   def assert_tier2_rejected_before_activation(fixture, script_env: fixture.fetch(:script_env))
     error = assert_raises(RuntimeError) do
       fixture.fetch(:harness).kandelo_build_package(script_env:)
@@ -607,6 +1070,51 @@ class KandeloFormulaSupportTest < Minitest::Test
     assert_includes error.message, "is not installed at /missing/Cellar/openssl/3.3.2_2"
   end
 
+  def test_tap_recipe_native_roots_use_declared_versioned_build_kegs_only
+    Dir.mktmpdir("kandelo-native-build-roots") do |dir|
+      base = Pathname(dir)
+      native_rack = base/"Cellar/cmake"
+      native_keg = native_rack/"4.1.0"
+      target_rack = base/"Cellar/zlib"
+      target_keg = target_rack/"1.3.1"
+      [native_keg, target_keg].each(&:mkpath)
+      formula_class = Struct.new(:full_name, :rack, :pkg_version, keyword_init: true)
+      dependency_class = Struct.new(:formula, :build_tag, :test_tag, keyword_init: true) do
+        def build? = build_tag
+        def test? = test_tag
+        def to_formula = formula
+      end
+      native = dependency_class.new(
+        formula: formula_class.new(
+          full_name: "cmake", rack: native_rack, pkg_version: "4.1.0"
+        ),
+        build_tag: true,
+        test_tag: false,
+      )
+      target = dependency_class.new(
+        formula: formula_class.new(
+          full_name: "kandelo-dev/tap-core/zlib",
+          rack: target_rack,
+          pkg_version: "1.3.1",
+        ),
+        build_tag: true,
+        test_tag: false,
+      )
+      runtime_only = dependency_class.new(
+        formula: formula_class.new(
+          full_name: "libidn2", rack: base/"Cellar/libidn2", pkg_version: "2.3.8"
+        ),
+        build_tag: false,
+        test_tag: false,
+      )
+      harness = Harness.new
+      harness.formula_full_name = "kandelo-dev/tap-core/hello"
+      harness.define_singleton_method(:deps) { [target, runtime_only, native] }
+
+      assert_equal [native_keg.to_s], harness.kandelo_tap_recipe_native_build_roots
+    end
+  end
+
   def test_verified_formula_source_is_isolated_from_bridge_work_and_output_roots
     Dir.mktmpdir("kandelo-formula-source") do |dir|
       build_path = Pathname(dir)/"build"
@@ -630,6 +1138,28 @@ class KandeloFormulaSupportTest < Minitest::Test
     end
   end
 
+  def test_verified_formula_source_excludes_homebrew_stage_home
+    Dir.mktmpdir("kandelo-formula-stage-home") do |dir|
+      build_path = Pathname(dir)/"build"
+      stage_home = build_path/".brew_home"
+      stage_home.mkpath
+      (stage_home/".bazelrc").write("startup --output_user_root=/tmp/bazel\n")
+      (stage_home/".gitignore").write("*\n")
+      (build_path/"upstream.c").write("int main(void) { return 0; }\n")
+      harness = Harness.new
+      harness.build_path = build_path
+
+      source_dir = harness.kandelo_stage_verified_formula_source
+
+      assert_equal "int main(void) { return 0; }\n",
+                   (source_dir/"upstream.c").read
+      refute_path_exists source_dir/".brew_home"
+      assert_equal "startup --output_user_root=/tmp/bazel\n",
+                   (stage_home/".bazelrc").read
+      assert_equal "*\n", (stage_home/".gitignore").read
+    end
+  end
+
   def test_verified_formula_source_rejects_an_empty_buildpath
     Dir.mktmpdir("kandelo-empty-formula-source") do |dir|
       harness = Harness.new
@@ -637,6 +1167,721 @@ class KandeloFormulaSupportTest < Minitest::Test
 
       error = assert_raises(RuntimeError) { harness.kandelo_stage_verified_formula_source }
       assert_includes error.message, "did not stage Formula source"
+    end
+  end
+
+  def test_tap_recipe_helper_uses_only_attested_inputs_and_homebrew_dependency_kegs
+    with_tap_recipe_build_fixture do |fixture|
+      ENV["HELLO_AMBIENT"] = "remove-me"
+      ENV["GITHUB_TOKEN"] = "must-not-reach-recipe"
+      ENV["HOMEBREW_KANDELO_XTASK_BIN"] = "/ambient/xtask"
+      ENV["HOMEBREW_GITHUB_PACKAGES_TOKEN"] = "must-not-reach-recipe"
+      ENV["NIX_PATH"] = "/ambient/nixpkgs"
+      ENV["WASM_POSIX_BINARY_CACHE_ROOT"] = "/ambient/cache"
+      ENV["WASM_POSIX_BINARY_INDEX_URL"] = "https://ambient.invalid/index.toml"
+      ENV["WASM_POSIX_BINARY_RESOLVER_REPO_ROOT"] = "/ambient/root"
+      ENV["WASM_POSIX_DEPS_REGISTRY"] = "/ambient/registry"
+      ENV["WASM_POSIX_FORK_INSTRUMENT"] = "/ambient/fork-instrument"
+      ENV["WASM_POSIX_LOCAL_BIN_DIR"] = "/ambient/local-binaries"
+      ENV["WASM_POSIX_LOCAL_ROOT_SPILL"] = "/ambient/local-root-spill"
+      ENV["WASM_POSIX_XTASK_BIN"] = "/ambient/xtask"
+
+      out_dir = run_tap_recipe(fixture)
+
+      assert_equal(
+        fixture.fetch(:build_path)/"kandelo-package-out",
+        out_dir.parent,
+      )
+      assert_match(
+        /\A\.kandelo-materializing-/,
+        out_dir.basename.to_s,
+      )
+      output_root = out_dir.parent
+      assert_equal 0700, output_root.lstat.mode & 07777
+      assert_equal Process.uid, output_root.lstat.uid
+      assert_equal [:sdk, :sysroot], fixture.fetch(:activation_calls)
+      assert_equal fixture.fetch(:recipe_runner).to_s,
+                   fixture.fetch(:harness).system_args.fetch(0)
+      refute fixture.fetch(:recipe_runner).to_s.start_with?("#{fixture.fetch(:root)}/")
+      assert_equal "--request", fixture.fetch(:harness).system_args.fetch(1)
+      assert_equal "--response", fixture.fetch(:harness).system_args.fetch(3)
+      request = fixture.fetch(:runner_requests).fetch(0)
+      assert_equal %w[
+        arch dependencies entrypoint environment formula limits
+        manifest_sha256 native_roots output_root platform_root recipe_root resources schema
+        source_root sysroot version work_root
+      ], request.keys.sort
+      assert_equal 1, request.fetch("schema")
+      assert_empty request.fetch("native_roots")
+      assert_equal fixture.fetch(:entrypoint).to_s, request.fetch("entrypoint")
+      assert_equal fixture.fetch(:build_path).join("kandelo-package-out").to_s,
+                   request.fetch("output_root")
+      assert_equal(
+        { "WASM_POSIX_DEP_ZLIB_DIR" => fixture.fetch(:dependency_keg).to_s },
+        request.fetch("dependencies"),
+      )
+      assert_empty request.fetch("resources")
+      environment = request.fetch("environment")
+      refute_equal fixture.fetch(:harness).system_environment, environment
+      %w[
+        GITHUB_TOKEN HOMEBREW_GITHUB_PACKAGES_TOKEN
+        HOMEBREW_KANDELO_TAP_RECIPE_RUNNER
+        HOMEBREW_KANDELO_TAP_RECIPE_SEALED_ROOT NIX_PATH
+      ].each { |key| refute environment.key?(key), key }
+      assert_equal "kandelo-homebrew-recipe", environment.fetch("USER")
+      assert_equal "kandelo-homebrew-recipe", environment.fetch("LOGNAME")
+      assert_equal fixture.fetch(:build_path).join("kandelo-package-work/home").to_s,
+                   environment.fetch("HOME")
+      assert_equal fixture.fetch(:build_path).join("kandelo-package-work/tmp").to_s,
+                   environment.fetch("TMPDIR")
+      assert_equal [
+        fixture.fetch(:root)/"sdk/bin",
+        fixture.fetch(:root)/"tools/bin",
+        Pathname("/usr/bin"),
+        Pathname("/bin"),
+      ].join(File::PATH_SEPARATOR), environment.fetch("PATH")
+      assert_equal "hello", environment.fetch("WASM_POSIX_DEP_NAME")
+      assert_equal "attested-value", environment.fetch("HELLO_VALUE")
+      assert_equal fixture.fetch(:recipe_root).to_s,
+                   environment.fetch("WASM_POSIX_DEP_RECIPE_DIR")
+      assert_equal fixture.fetch(:dependency_keg).to_s,
+                   environment.fetch("WASM_POSIX_DEP_ZLIB_DIR")
+      assert_equal fixture.fetch(:build_path).join("kandelo-package-source").to_s,
+                   environment.fetch("WASM_POSIX_DEP_SOURCE_DIR")
+      assert_equal fixture.fetch(:build_path).join("kandelo-package-work").to_s,
+                   environment.fetch("WASM_POSIX_DEP_WORK_DIR")
+      assert_equal fixture.fetch(:build_path).join("kandelo-package-out").to_s,
+                   environment.fetch("WASM_POSIX_DEP_OUT_DIR")
+      assert_equal fixture.fetch(:fork_instrument).to_s,
+                   environment.fetch("WASM_POSIX_FORK_INSTRUMENT")
+      assert_equal fixture.fetch(:local_root_spill).to_s,
+                   environment.fetch("WASM_POSIX_LOCAL_ROOT_SPILL")
+      %w[
+        HOMEBREW_KANDELO_XTASK_BIN WASM_POSIX_BINARY_CACHE_ROOT
+        WASM_POSIX_BINARY_INDEX_URL WASM_POSIX_BINARY_RESOLVER_REPO_ROOT
+        WASM_POSIX_DEPS_REGISTRY WASM_POSIX_LOCAL_BIN_DIR WASM_POSIX_XTASK_BIN
+      ].each { |key| refute environment.key?(key), key }
+      refute environment.key?("HELLO_AMBIENT")
+      assert_equal "int main(void) { return 0; }\n",
+                   (fixture.fetch(:build_path)/"kandelo-package-source/upstream.c").binread
+      assert_equal "tap recipe output\n", (out_dir/"bin/hello").binread
+      assert_equal(
+        Pathname("../libexec/tools/helper"),
+        (out_dir/"bin/hello-current").readlink,
+      )
+      assert_equal "nested helper\n", (out_dir/"libexec/tools/helper").binread
+      assert_equal "archive payload\n", (out_dir/"lib/libhello.a").binread
+      assert_equal "nested data\n", (out_dir/"share/hello/data.txt").binread
+      assert_equal "executable shared helper\n",
+                   (out_dir/"share/hello/run-helper").binread
+      assert_equal "non-executable bin data\n",
+                   (out_dir/"bin/readme.txt").binread
+      expected_file_modes = {
+        "bin/hello"                 => 0755,
+        "bin/readme.txt"            => 0644,
+        "lib/libhello.a"            => 0644,
+        "libexec/tools/helper"      => 0755,
+        "share/hello/data.txt"      => 0644,
+        "share/hello/run-helper"    => 0755,
+      }
+      observed_files = []
+      out_dir.find do |entry|
+        stat = entry.lstat
+        assert_equal Process.uid, stat.uid, entry.to_s
+        next if stat.symlink?
+
+        if stat.directory?
+          assert_equal 0755, stat.mode & 07777, entry.to_s
+        else
+          relative = entry.relative_path_from(out_dir).to_s
+          observed_files << relative
+          assert_equal(
+            expected_file_modes.fetch(relative),
+            stat.mode & 07777,
+            entry.to_s,
+          )
+        end
+      end
+      assert_equal expected_file_modes.keys.sort, observed_files.sort
+      refute_path_exists fixture.fetch(:prefix_path)
+
+      # Formula evaluation must not permanently rewrite the caller's process
+      # environment, even when the build succeeds.
+      assert_equal "/ambient/cache", ENV.fetch("WASM_POSIX_BINARY_CACHE_ROOT")
+      assert_equal "/ambient/fork-instrument", ENV.fetch("WASM_POSIX_FORK_INSTRUMENT")
+      assert_equal "/ambient/local-root-spill", ENV.fetch("WASM_POSIX_LOCAL_ROOT_SPILL")
+      assert_equal "/ambient/xtask", ENV.fetch("WASM_POSIX_XTASK_BIN")
+    end
+  end
+
+  def test_tap_recipe_helper_propagates_runner_failure_and_cleans_protocol_files
+    with_tap_recipe_build_fixture do |fixture|
+      message =
+        "homebrew-tap-recipe-runner: recipe diagnostics: compiler failed"
+      request_path =
+        fixture.fetch(:build_path)/".kandelo-tap-recipe-request.json"
+      response_path =
+        fixture.fetch(:build_path)/".kandelo-tap-recipe-response.json"
+      fixture.fetch(:system_hooks) << lambda do
+        response_path.binwrite("incomplete runner response")
+        raise message
+      end
+
+      error = assert_raises(RuntimeError) { run_tap_recipe(fixture) }
+
+      assert_equal message, error.message
+      refute_path_exists request_path
+      refute_path_exists response_path
+    end
+  end
+
+  def test_tap_recipe_materialization_survives_real_homebrew_install_moves
+    with_tap_recipe_build_fixture do |fixture|
+      sealed_before = nil
+      fixture.fetch(:runner_return_hooks) << lambda do |sealed, _response|
+        sealed_before = tap_recipe_tree_snapshot(sealed)
+      end
+      out_dir = run_tap_recipe(fixture)
+      sealed_output = fixture.fetch(:sealed_root).children.fetch(0)
+      assert_equal sealed_before, tap_recipe_tree_snapshot(sealed_output)
+      installed = fixture.fetch(:build_path).parent/"installed-prefix"
+      installed.mkpath
+
+      # Exercise pinned Homebrew's real Pathname#install implementation. It
+      # moves these Formula-owned nodes; the runner evidence must remain
+      # byte-for-byte and mode-for-mode unchanged.
+      installed.install(out_dir.children)
+
+      assert_empty out_dir.children
+      assert_equal sealed_before, tap_recipe_tree_snapshot(sealed_output)
+      assert_equal "tap recipe output\n", (installed/"bin/hello").binread
+      assert_equal "nested helper\n",
+                   (installed/"libexec/tools/helper").binread
+      assert_equal "archive payload\n", (installed/"lib/libhello.a").binread
+      assert_equal "nested data\n",
+                   (installed/"share/hello/data.txt").binread
+      assert_equal 0644, (installed/"bin/readme.txt").lstat.mode & 07777
+      assert_equal 0755,
+                   (installed/"share/hello/run-helper").lstat.mode & 07777
+      assert_equal(
+        Pathname("../libexec/tools/helper"),
+        (installed/"bin/hello-current").readlink,
+      )
+    end
+  end
+
+  def test_tap_recipe_rejects_output_root_replacement_mode_and_contents
+    mutations = {
+      "replacement" => lambda do |root|
+        root.rmdir
+        root.mkdir(0700)
+      end,
+      "symlink replacement" => lambda do |root|
+        alternate = root.parent/"alternate-output-root"
+        alternate.mkdir(0700)
+        root.rmdir
+        root.make_symlink(alternate)
+      end,
+      "mode drift" => ->(root) { root.chmod(0755) },
+      "foreign contents" => ->(root) { (root/"foreign").binwrite("foreign\n") },
+    }
+    mutations.each do |label, mutate|
+      with_tap_recipe_build_fixture do |fixture|
+        root = fixture.fetch(:build_path)/"kandelo-package-out"
+        fixture.fetch(:runner_return_hooks) << lambda do |_sealed, _response|
+          mutate.call(root)
+        end
+
+        error = assert_raises(RuntimeError, label) { run_tap_recipe(fixture) }
+
+        assert_match(/output root|unexpected entries/i, error.message, label)
+        if label == "foreign contents"
+          assert_equal "foreign\n", (root/"foreign").binread
+        end
+      end
+    end
+  end
+
+  def test_tap_recipe_copy_failure_leaves_private_nodes_for_outer_cleanup
+    with_tap_recipe_build_fixture do |fixture|
+      harness = fixture.fetch(:harness)
+      harness.define_singleton_method(
+        :kandelo_tap_recipe_copy_stream,
+      ) do |_source, destination|
+        destination.write("partial bytes")
+        raise "injected materialization copy failure"
+      end
+
+      error = assert_raises(RuntimeError) { run_tap_recipe(fixture) }
+
+      assert_equal "injected materialization copy failure", error.message
+      output_root = fixture.fetch(:build_path)/"kandelo-package-out"
+      staging = output_root.children.fetch(0)
+      assert_match(/\A\.kandelo-materializing-/, staging.basename.to_s)
+      assert_equal 0700, staging.lstat.mode & 07777
+      assert_equal "partial bytes",
+                   (staging/"share/hello/data.txt").binread
+    end
+
+    with_tap_recipe_build_fixture do |fixture|
+      harness = fixture.fetch(:harness)
+      original = harness.method(:kandelo_tap_recipe_copy_file!)
+      harness.define_singleton_method(
+        :kandelo_tap_recipe_copy_file!,
+      ) do |source, destination, source_stat|
+        original.call(source, destination, source_stat)
+        next unless source.basename.to_s == "data.txt"
+
+        (destination.dirname/"foreign").binwrite("must survive failure\n")
+        raise "injected copy failure with foreign entry"
+      end
+
+      error = assert_raises(RuntimeError) { run_tap_recipe(fixture) }
+
+      assert_equal "injected copy failure with foreign entry", error.message
+      output_root = fixture.fetch(:build_path)/"kandelo-package-out"
+      staging = output_root.children.fetch(0)
+      assert_match(/\A\.kandelo-materializing-/, staging.basename.to_s)
+      foreign = staging/"share/hello/foreign"
+      assert_equal "must survive failure\n", foreign.binread
+      assert_equal "nested data\n",
+                   (staging/"share/hello/data.txt").binread
+    end
+
+    with_tap_recipe_build_fixture do |fixture|
+      harness = fixture.fetch(:harness)
+      original = harness.method(:kandelo_tap_recipe_original_output_root!)
+      private_checks = 0
+      harness.define_singleton_method(
+        :kandelo_tap_recipe_original_output_root!,
+      ) do |out_dir, build_root, handle, identity, entries:|
+        result = original.call(
+          out_dir, build_root, handle, identity, entries:
+        )
+        if entries.one? &&
+           entries.fetch(0).start_with?(".kandelo-materializing-")
+          private_checks += 1
+        end
+        if private_checks == 2
+          raise "injected final pre-return verification failure"
+        end
+        result
+      end
+
+      error = assert_raises(RuntimeError) { run_tap_recipe(fixture) }
+
+      assert_equal(
+        "injected final pre-return verification failure",
+        error.message,
+      )
+      output_root =
+        fixture.fetch(:build_path)/"kandelo-package-out"
+      refute_path_exists output_root/"contents"
+      published = output_root.children.fetch(0)
+      assert_match(/\A\.kandelo-materializing-/,
+                   published.basename.to_s)
+      assert_equal "nested data\n",
+                   (published/"share/hello/data.txt").binread
+    end
+
+    materializer = Pathname(__dir__).join(
+      "..", "kandelo_formula_support.rb"
+    ).binread.match(
+      /  def kandelo_materialize_tap_recipe_output!.*?^  end$/m,
+    )[0]
+    refute_match(
+      /(?:File\.rename|File\.unlink|Dir\.rmdir|FileUtils\.)/,
+      materializer,
+    )
+  end
+
+  def test_tap_recipe_helper_accepts_only_the_exact_launcher_sealed_input_modes
+    with_tap_recipe_build_fixture do |fixture|
+      runtime, recipe = fixture.fetch(:harness).kandelo_tap_recipe_runtime!
+      recipe_root, entrypoint =
+        fixture.fetch(:harness).kandelo_verify_tap_recipe_tree!(runtime, recipe)
+
+      assert_equal fixture.fetch(:recipe_root), recipe_root
+      assert_equal fixture.fetch(:entrypoint), entrypoint
+      [
+        fixture.fetch(:tap_root),
+        fixture.fetch(:tap_root)/"Kandelo",
+        fixture.fetch(:tap_root)/"Kandelo/recipes",
+        fixture.fetch(:recipe_root),
+        fixture.fetch(:recipe_root)/"patches",
+      ].each do |directory|
+        assert_equal 0555, directory.lstat.mode & 0777, directory.to_s
+      end
+      assert_equal 0444, fixture.fetch(:manifest_path).lstat.mode & 0777
+      assert_equal 0555, fixture.fetch(:entrypoint).lstat.mode & 0777
+      assert_equal 0444, fixture.fetch(:patch).lstat.mode & 0777
+    end
+
+    mode_mutations = {
+      "tap root is writable"          => [:tap_root, nil, 0755],
+      "Kandelo directory is writable" => [:tap_root, "Kandelo", 0755],
+      "recipes directory is writable" => [:tap_root, "Kandelo/recipes", 0755],
+      "recipe directory is writable"  => [:recipe_root, nil, 0755],
+      "nested directory is writable"  => [:recipe_root, "patches", 0755],
+      "directory is over-restricted"  => [:recipe_root, "patches", 0500],
+      "manifest is writable"          => [:manifest_path, nil, 0644],
+      "manifest is over-restricted"   => [:manifest_path, nil, 0400],
+      "entrypoint retains source mode" => [:entrypoint, nil, 0755],
+      "entrypoint loses executable meaning" => [:entrypoint, nil, 0444],
+      "data input retains source mode" => [:patch, nil, 0644],
+      "data input gains executable meaning" => [:patch, nil, 0555],
+    }
+    mode_mutations.each do |label, (fixture_key, relative, mode)|
+      with_tap_recipe_build_fixture do |fixture|
+        path = fixture.fetch(fixture_key)
+        path = path/relative unless relative.nil?
+        path.chmod(mode)
+
+        error = assert_tap_recipe_rejected_before_activation(fixture)
+
+        assert_match(/mode|sealed/i, error.message, label)
+      end
+    end
+  end
+
+  def test_tap_recipe_helper_stages_attested_resources_at_fixed_guest_paths
+    resource_record = {
+      "name"          => "chocolate-doom",
+      "source_sha256" => "b" * 64,
+      "source_url"    => "https://example.test/chocolate-doom.tar.gz",
+    }
+    with_tap_recipe_build_fixture(resource_records: [resource_record]) do |fixture|
+      out_dir = run_tap_recipe(fixture)
+      request = fixture.fetch(:runner_requests).fetch(0)
+      staged = fixture.fetch(:build_path)/
+        "kandelo-package-resources/chocolate-doom"
+
+      assert_equal(
+        { "chocolate-doom" => staged.to_s },
+        request.fetch("resources"),
+      )
+      assert_equal(
+        "/kandelo/resources/chocolate-doom",
+        request.fetch("environment").fetch(
+          "WASM_POSIX_DEP_RESOURCE_CHOCOLATE_DOOM_DIR",
+        ),
+      )
+      assert_equal(
+        "verified chocolate-doom resource\n",
+        (staged/"input.txt").binread,
+      )
+      refute_path_exists(
+        fixture.fetch(:build_path)/
+          "kandelo-package-source/kandelo-package-resources",
+      )
+      assert_equal "tap recipe output\n", (out_dir/"bin/hello").binread
+    end
+  end
+
+  def test_tap_recipe_helper_rejects_resource_identity_drift_before_activation
+    resource_record = {
+      "name"          => "resource",
+      "source_sha256" => "b" * 64,
+      "source_url"    => "https://example.test/resource.tar.gz",
+    }
+    with_tap_recipe_build_fixture(resource_records: [resource_record]) do |fixture|
+      selected = fixture.fetch(:harness).resources.fetch("resource")
+      selected.source_sha256 = "c" * 64 if selected.respond_to?(:source_sha256=)
+      selected.checksum.hexdigest = "c" * 64
+
+      error = assert_tap_recipe_rejected_before_activation(fixture)
+
+      assert_includes error.message, "resource identity differs"
+    end
+  end
+
+  def test_tap_recipe_helper_rejects_mutated_or_unlisted_inputs_before_execution
+    mutations = {
+      "manifest bytes" => lambda do |fixture|
+        fixture.fetch(:manifest_path).binwrite("{}\n")
+      end,
+      "unlisted input" => lambda do |fixture|
+        (fixture.fetch(:recipe_root)/"unlisted.patch").binwrite("unlisted\n")
+      end,
+      "missing input" => lambda do |fixture|
+        fixture.fetch(:patch).delete
+      end,
+      "mutated input" => lambda do |fixture|
+        fixture.fetch(:patch).binwrite("changed\n")
+      end,
+      "mode input" => lambda do |fixture|
+        fixture.fetch(:patch).chmod(0755)
+      end,
+      "symlink input" => lambda do |fixture|
+        target = fixture.fetch(:recipe_root).parent/"outside.patch"
+        target.binwrite("outside\n")
+        fixture.fetch(:patch).delete
+        fixture.fetch(:patch).make_symlink(target)
+      end,
+      "hard-linked input" => lambda do |fixture|
+        target = fixture.fetch(:recipe_root).parent/"outside.patch"
+        target.binwrite(fixture.fetch(:patch).binread)
+        fixture.fetch(:patch).delete
+        File.link(target, fixture.fetch(:patch))
+      end,
+    }
+    mutations.each do |label, mutate|
+      with_tap_recipe_build_fixture do |fixture|
+        mutate_sealed_tap_recipe_fixture!(fixture) { mutate.call(fixture) }
+        error = assert_tap_recipe_rejected_before_activation(fixture)
+        assert_match(/manifest|recipe|link|unavailable|closure|tree|file/i, error.message, label)
+      end
+    end
+  end
+
+  def test_tap_recipe_helper_rejects_traversal_even_in_an_attested_manifest
+    with_tap_recipe_build_fixture do |fixture|
+      mutate_sealed_tap_recipe_fixture!(fixture) do
+        manifest = JSON.parse(fixture.fetch(:manifest_path).binread)
+        manifest.fetch("files").first["path"] = "../build.sh"
+        fixture.fetch(:manifest_path).binwrite(JSON.generate(manifest))
+        fixture.fetch(:recipe)["manifest_sha256"] =
+          Digest::SHA256.file(fixture.fetch(:manifest_path)).hexdigest
+      end
+
+      error = assert_tap_recipe_rejected_before_activation(fixture)
+
+      assert_includes error.message, "canonical relative path"
+    end
+  end
+
+  def test_tap_recipe_helper_rejects_dependency_environment_name_collisions
+    with_tap_recipe_build_fixture do |fixture|
+      dependencies = [
+        "kandelo-dev/tap-core/foo-bar",
+        "kandelo-dev/tap-core/foo_bar",
+      ]
+      mutate_sealed_tap_recipe_fixture!(fixture) do
+        manifest = JSON.parse(fixture.fetch(:manifest_path).binread)
+        manifest["dependencies"] = dependencies
+        fixture.fetch(:manifest_path).binwrite("#{JSON.pretty_generate(manifest)}\n")
+        fixture.fetch(:recipe)["dependencies"] = dependencies
+        fixture.fetch(:recipe)["manifest_sha256"] =
+          Digest::SHA256.file(fixture.fetch(:manifest_path)).hexdigest
+      end
+
+      error = assert_tap_recipe_rejected_before_activation(fixture)
+
+      assert_includes error.message, "collide in their build environment names"
+    end
+  end
+
+  def test_tap_recipe_helper_rejects_formula_environment_drift_before_execution
+    with_tap_recipe_build_fixture do |fixture|
+      error = assert_tap_recipe_rejected_before_activation(
+        fixture, script_env: { "HELLO_DIFFERENT" => "value" }
+      )
+
+      assert_includes error.message, "script_env differs"
+    end
+  end
+
+  def test_tap_recipe_helper_revalidates_inputs_after_the_script_returns
+    with_tap_recipe_build_fixture do |fixture|
+      fixture.fetch(:system_hooks) << lambda do
+        mutate_sealed_tap_recipe_fixture!(fixture) do
+          fixture.fetch(:patch).binwrite("changed by recipe\n")
+        end
+      end
+
+      error = assert_raises(RuntimeError) { run_tap_recipe(fixture) }
+
+      assert_includes error.message, "differs from its manifest"
+      assert_equal [:sdk, :sysroot], fixture.fetch(:activation_calls)
+      refute_nil fixture.fetch(:harness).system_calls
+    end
+  end
+
+  def test_tap_recipe_helper_rejects_output_mutated_after_the_runner_seals_it
+    with_tap_recipe_build_fixture do |fixture|
+      fixture.fetch(:runner_return_hooks) << lambda do |sealed_out, _response|
+        output = sealed_out/"bin/hello"
+        output.chmod(0644)
+        output.binwrite("changed after seal\n")
+        output.chmod(0444)
+      end
+
+      error = assert_raises(RuntimeError) { run_tap_recipe(fixture) }
+
+      assert_includes error.message, "differs from the runner response"
+      assert_equal 1, fixture.fetch(:runner_requests).length
+    end
+  end
+
+  def test_tap_recipe_helper_rejects_malformed_or_unsealed_runner_responses
+    mutations = {
+      "wrong request digest" => lambda do |_sealed_out, response|
+        document = JSON.parse(response.binread)
+        document["request_sha256"] = "0" * 64
+        response.chmod(0644)
+        response.binwrite(JSON.generate(document))
+        response.chmod(0444)
+      end,
+      "unknown response field" => lambda do |_sealed_out, response|
+        document = JSON.parse(response.binread)
+        document["unknown"] = true
+        response.chmod(0644)
+        response.binwrite(JSON.generate(document))
+        response.chmod(0444)
+      end,
+      "noncanonical response" => lambda do |_sealed_out, response|
+        bytes = response.binread
+        response.chmod(0644)
+        response.binwrite("#{bytes}\n")
+        response.chmod(0444)
+      end,
+      "reordered response fields" => lambda do |_sealed_out, response|
+        document = JSON.parse(response.binread)
+        reordered = document.keys.reverse.to_h { |key| [key, document.fetch(key)] }
+        response.chmod(0644)
+        response.binwrite(JSON.generate(reordered))
+        response.chmod(0444)
+      end,
+      "writable response" => lambda do |_sealed_out, response|
+        response.chmod(0644)
+      end,
+      "hard-linked response" => lambda do |_sealed_out, response|
+        File.link(response, response.dirname/"response-alias")
+      end,
+      "outside output root" => lambda do |_sealed_out, response|
+        document = JSON.parse(response.binread)
+        document["sealed_output_root"] = response.dirname.to_s
+        response.chmod(0644)
+        response.binwrite(JSON.generate(document))
+        response.chmod(0444)
+      end,
+      "writable sealed file" => lambda do |sealed_out, _response|
+        (sealed_out/"bin/hello").chmod(0644)
+      end,
+    }
+    mutations.each do |label, mutate|
+      with_tap_recipe_build_fixture do |fixture|
+        fixture.fetch(:runner_return_hooks) << mutate
+
+        error = assert_raises(RuntimeError, label) { run_tap_recipe(fixture) }
+
+        assert_match(
+          /request|response|schema|sealed|safe mode|protected sealed root/i,
+          error.message,
+          label,
+        )
+      end
+    end
+  end
+
+  def test_tap_recipe_helper_rejects_output_that_escapes_or_aliases_staging
+    mutations = {
+      "escaping symlink" => lambda do |fixture|
+        link = fixture.fetch(:runner_output)/"bin/hello-current"
+        link.delete
+        link.make_symlink("../../outside")
+      end,
+      "hard-linked file" => lambda do |fixture|
+        file = fixture.fetch(:runner_output)/"bin/hello"
+        alias_path = fixture.fetch(:runner_output)/"bin/hello-alias"
+        File.link(file, alias_path)
+      end,
+      "direct prefix output" => lambda do |fixture|
+        fixture.fetch(:prefix_path).mkpath
+        (fixture.fetch(:prefix_path)/"escaped").binwrite("wrong root\n")
+      end,
+    }
+    mutations.each do |label, mutate|
+      with_tap_recipe_build_fixture do |fixture|
+        fixture.fetch(:system_hooks) << -> { mutate.call(fixture) }
+
+        error = assert_raises(RuntimeError, label) { run_tap_recipe(fixture) }
+
+        assert_match(/escapes|one link|staging prefix/i, error.message, label)
+      end
+    end
+  end
+
+  def test_tap_recipe_helper_rejects_unsafe_or_oversized_output
+    mutations = {
+      "world-writable file" => lambda do |fixture|
+        (fixture.fetch(:runner_output)/"bin/hello").chmod(0666)
+      end,
+      "set-id file" => lambda do |fixture|
+        (fixture.fetch(:runner_output)/"bin/hello").chmod(04644)
+      end,
+      "world-writable directory" => lambda do |fixture|
+        (fixture.fetch(:runner_output)/"bin").chmod(0777)
+      end,
+      "control character in path" => lambda do |fixture|
+        (fixture.fetch(:runner_output)/"bad\nname").binwrite("bad path\n")
+      end,
+      "control character in symlink target" => lambda do |fixture|
+        link = fixture.fetch(:runner_output)/"bin/hello-current"
+        link.delete
+        link.make_symlink("hello\n")
+      end,
+      "oversized file" => lambda do |fixture|
+        path = fixture.fetch(:runner_output)/"bin/oversized"
+        File.open(path, "wb") do |file|
+          file.truncate(KandeloFormulaSupport::KANDELO_TAP_RECIPE_OUTPUT_FILE_MAX_BYTES + 1)
+        end
+      end,
+      "oversized tree" => lambda do |fixture|
+        out = fixture.fetch(:runner_output)
+        %w[first second].each do |basename|
+          File.open(out/basename, "wb") do |file|
+            file.truncate(KandeloFormulaSupport::KANDELO_TAP_RECIPE_OUTPUT_FILE_MAX_BYTES)
+          end
+        end
+      end,
+    }
+    mutations.each do |label, mutate|
+      with_tap_recipe_build_fixture do |fixture|
+        fixture.fetch(:system_hooks) << -> { mutate.call(fixture) }
+
+        error = assert_raises(RuntimeError, label) { run_tap_recipe(fixture) }
+
+        assert_match(/mode|path|symlink|byte limit/i, error.message, label)
+      end
+    end
+  end
+
+  def test_tap_recipe_output_limits_count_entries_and_full_relative_paths
+    Dir.mktmpdir("kandelo-tap-recipe-output-limits") do |dir|
+      out = Pathname(dir)/"out"
+      out.mkpath
+      (out/"first").binwrite("first\n")
+      (out/"second").binwrite("second\n")
+      harness = Harness.new
+
+      entry_error = assert_raises(RuntimeError) do
+        harness.kandelo_validate_tap_recipe_output!(out, max_entries: 1)
+      end
+      assert_includes entry_error.message, "too many filesystem entries"
+
+      path_error = assert_raises(RuntimeError) do
+        harness.kandelo_validate_tap_recipe_output!(out, max_path_bytes: 4)
+      end
+      assert_includes path_error.message, "invalid or oversized path"
+
+      alias_parent = Pathname(dir)/"alias"
+      alias_parent.make_symlink(".")
+      root_error = assert_raises(RuntimeError) do
+        harness.kandelo_validate_tap_recipe_output!(alias_parent/"out")
+      end
+      assert_includes root_error.message, "canonical real directory"
+    end
+  end
+
+  def test_tap_recipe_helper_rejects_an_unselected_or_missing_dependency
+    with_tap_recipe_build_fixture do |fixture|
+      fixture.fetch(:harness).runtime_formulae = []
+
+      error = assert_raises(RuntimeError) { run_tap_recipe(fixture) }
+
+      assert_includes error.message, "not a selected target dependency"
+      assert_nil fixture.fetch(:harness).system_calls
     end
   end
 
@@ -667,6 +1912,270 @@ class KandeloFormulaSupportTest < Minitest::Test
 
       assert status.success?, stderr
       assert_equal "evaluated\n", marker.binread
+    end
+  end
+
+  def test_support_load_accepts_and_deeply_freezes_a_tap_recipe_attestation
+    with_tier2_loader_fixture do |fixture|
+      document = tier2_loader_attestation(fixture, bridge: false, recipe: true)
+      write_tier2_loader_attestation(fixture, JSON.generate(document))
+      assertion = <<~'RUBY'
+        runtime = KandeloFormulaSupport::KANDELO_TIER2_RUNTIME
+        document = runtime.fetch("attestation")
+        recipe = document.fetch("tap_recipe")
+        abort "tap recipe schema was not loaded" unless
+          document.fetch("schema") == 3 &&
+          document.fetch("tier2_bridge").nil? &&
+          recipe.fetch("entrypoint") == "build.sh"
+        abort "tap recipe authority was not deeply frozen" unless
+          [runtime, document, recipe, recipe.fetch("dependencies"),
+           recipe.fetch("dependencies").first,
+           runtime.fetch("tap_recipe_tools"),
+           runtime.fetch("tap_recipe_tools").fetch("fork_instrument"),
+           runtime.fetch("tap_recipe_tools").fetch("local_root_spill"),
+           runtime.fetch("tap_recipe_runner_path"),
+           runtime.fetch("tap_recipe_sealed_root")].all?(&:frozen?)
+      RUBY
+      _stdout, stderr, status = run_tier2_support_load(
+        fixture, assertion, simulated_owner_uid: 0
+      )
+
+      assert status.success?, stderr
+    end
+  end
+
+  def test_support_load_rejects_unsealed_or_unbound_tap_recipe_platform_tools
+    mutations = {
+      "missing selection" => lambda do |_fixture|
+        { "HOMEBREW_KANDELO_FORK_INSTRUMENT" => "" }
+      end,
+      "outside projection" => lambda do |fixture|
+        outside = fixture.fetch(:base)/"outside-fork-instrument"
+        outside.binwrite("#!/bin/sh\nexit 0\n")
+        outside.chmod(0555)
+        { "HOMEBREW_KANDELO_FORK_INSTRUMENT" => outside.to_s }
+      end,
+      "symlink" => lambda do |fixture|
+        tool = fixture.fetch(:fork_instrument)
+        tool.delete
+        tool.make_symlink(fixture.fetch(:local_root_spill))
+        {}
+      end,
+      "writable executable" => lambda do |fixture|
+        fixture.fetch(:fork_instrument).chmod(0755)
+        {}
+      end,
+      "hard-linked executable" => lambda do |fixture|
+        File.link(
+          fixture.fetch(:fork_instrument),
+          fixture.fetch(:fork_instrument).dirname/"fork-instrument-alias",
+        )
+        {}
+      end,
+      "writable ancestor" => lambda do |fixture|
+        fixture.fetch(:fork_instrument).dirname.chmod(0777)
+        {}
+      end,
+      "missing runner selection" => lambda do |_fixture|
+        { "HOMEBREW_KANDELO_TAP_RECIPE_RUNNER" => "" }
+      end,
+      "writable runner" => lambda do |fixture|
+        fixture.fetch(:recipe_runner).chmod(0755)
+        {}
+      end,
+      "empty runner" => lambda do |fixture|
+        fixture.fetch(:recipe_runner).chmod(0755)
+        fixture.fetch(:recipe_runner).binwrite("")
+        fixture.fetch(:recipe_runner).chmod(0555)
+        {}
+      end,
+      "symlink runner" => lambda do |fixture|
+        fixture.fetch(:protected_root).chmod(0755)
+        fixture.fetch(:recipe_runner).delete
+        fixture.fetch(:recipe_runner).make_symlink(fixture.fetch(:local_root_spill))
+        fixture.fetch(:protected_root).chmod(0555)
+        {}
+      end,
+      "hard-linked runner" => lambda do |fixture|
+        fixture.fetch(:protected_root).chmod(0755)
+        File.link(
+          fixture.fetch(:recipe_runner),
+          fixture.fetch(:protected_root)/"runner-alias",
+        )
+        fixture.fetch(:protected_root).chmod(0555)
+        {}
+      end,
+      "writable protected build root" => lambda do |fixture|
+        fixture.fetch(:protected_root).chmod(0755)
+        {}
+      end,
+      "wrong protected build root name" => lambda do |fixture|
+        fixture.fetch(:protected_anchor).chmod(0755)
+        invalid_root = fixture.fetch(:protected_anchor)/"current"
+        invalid_runner = invalid_root/"homebrew-tap-recipe-runner"
+        invalid_sealed_root = invalid_root/"sealed-outputs"
+        [invalid_root, invalid_sealed_root].each(&:mkpath)
+        invalid_runner.binwrite("#!/bin/sh\nexit 0\n")
+        invalid_runner.chmod(0555)
+        invalid_sealed_root.chmod(0555)
+        invalid_root.chmod(0555)
+        fixture.fetch(:protected_anchor).chmod(0711)
+        {
+          "HOMEBREW_KANDELO_TAP_RECIPE_RUNNER" => invalid_runner.to_s,
+          "HOMEBREW_KANDELO_TAP_RECIPE_SEALED_ROOT" => invalid_sealed_root.to_s,
+        }
+      end,
+      "writable protected anchor" => lambda do |fixture|
+        fixture.fetch(:protected_anchor).chmod(0755)
+        {}
+      end,
+      "missing sealed root selection" => lambda do |_fixture|
+        { "HOMEBREW_KANDELO_TAP_RECIPE_SEALED_ROOT" => "" }
+      end,
+      "writable sealed root" => lambda do |fixture|
+        fixture.fetch(:sealed_root).chmod(0755)
+        {}
+      end,
+    }
+    mutations.each do |label, mutate|
+      with_tier2_loader_fixture do |fixture|
+        document = tier2_loader_attestation(fixture, bridge: false, recipe: true)
+        write_tier2_loader_attestation(fixture, JSON.generate(document))
+        environment = mutate.call(fixture)
+        marker = fixture.fetch(:base)/"#{label.tr(" ", "-")}-evaluated"
+
+        _stdout, stderr, status = run_tier2_support_load(
+          fixture,
+          "File.binwrite(#{marker.to_s.inspect}, \"evaluated\\n\")",
+          environment:,
+          simulated_owner_uid: 0,
+        )
+
+        refute status.success?, label
+        assert_match(/closed tap recipe|platform projection/i, stderr, label)
+        refute_path_exists marker, label
+      end
+    end
+  end
+
+  def test_support_load_rejects_malformed_tap_recipe_authority_before_formula_evaluation
+    with_tier2_loader_fixture do |fixture|
+      valid = tier2_loader_attestation(fixture, bridge: false, recipe: true)
+      missing_recipe_key = Marshal.load(Marshal.dump(valid))
+      missing_recipe_key.fetch("tap_recipe").delete("manifest_sha256")
+      unsorted_dependencies = Marshal.load(Marshal.dump(valid))
+      unsorted_dependencies.fetch("tap_recipe")["dependencies"] = [
+        "kandelo-dev/tap-core/zlib",
+        "kandelo-dev/tap-core/bzip2",
+      ]
+      colliding_dependencies = Marshal.load(Marshal.dump(valid))
+      colliding_dependencies.fetch("tap_recipe")["dependencies"] = [
+        "kandelo-dev/tap-core/foo-bar",
+        "kandelo-dev/tap-core/foo_bar",
+      ]
+      resource_record = {
+        "name"          => "fixture-data",
+        "source_sha256" => "e" * 64,
+        "source_url"    => "https://example.test/fixture-data.tar.gz",
+      }
+      unknown_resource_key = Marshal.load(Marshal.dump(valid))
+      unknown_resource_key.fetch("tap_recipe")["resources"] = [
+        resource_record.merge("path" => "/caller/selected"),
+      ]
+      unsorted_resources = Marshal.load(Marshal.dump(valid))
+      unsorted_resources.fetch("tap_recipe")["resources"] = [
+        resource_record.merge("name" => "z-data"),
+        resource_record.merge("name" => "a-data"),
+      ]
+      colliding_resources = Marshal.load(Marshal.dump(valid))
+      colliding_resources.fetch("tap_recipe")["resources"] = [
+        resource_record.merge("name" => "fixture-data"),
+        resource_record.merge("name" => "fixture_data"),
+      ]
+      resource_env_override = Marshal.load(Marshal.dump(valid))
+      resource_env_override.fetch("tap_recipe")["resources"] = [resource_record]
+      resource_env_override.fetch("tap_recipe")["script_env_keys"] = [
+        "WASM_POSIX_DEP_RESOURCE_FIXTURE_DATA_DIR",
+      ]
+      dependency_resource_collision = Marshal.load(Marshal.dump(valid))
+      dependency_resource_collision.fetch("tap_recipe")["resources"] = [resource_record]
+      dependency_resource_collision.fetch("tap_recipe")["dependencies"] = [
+        "kandelo-dev/tap-core/resource-fixture-data",
+      ]
+      both_paths = Marshal.load(Marshal.dump(valid))
+      both_paths["tier2_bridge"] =
+        tier2_loader_attestation(fixture).fetch("tier2_bridge")
+      mutations = {
+        "missing recipe"         => valid.merge("tap_recipe" => nil),
+        "missing recipe key"     => missing_recipe_key,
+        "unknown recipe key"     => valid.merge(
+          "tap_recipe" => valid.fetch("tap_recipe").merge("unknown" => true),
+        ),
+        "traversal entrypoint"   => valid.merge(
+          "tap_recipe" => valid.fetch("tap_recipe").merge("entrypoint" => "../build.sh"),
+        ),
+        "unqualified dependency" => valid.merge(
+          "tap_recipe" => valid.fetch("tap_recipe").merge("dependencies" => ["zlib"]),
+        ),
+        "unsorted dependencies"  => unsorted_dependencies,
+        "colliding dependencies" => colliding_dependencies,
+        "unknown resource key"   => unknown_resource_key,
+        "unsorted resources"     => unsorted_resources,
+        "colliding resources"    => colliding_resources,
+        "resource env override"  => resource_env_override,
+        "dependency resource collision" => dependency_resource_collision,
+        "oversized resource URL" => valid.merge(
+          "tap_recipe" => valid.fetch("tap_recipe").merge(
+            "resources" => [
+              resource_record.merge("source_url" => "https://example.test/#{"a" * 1005}"),
+            ],
+          ),
+        ),
+        "both build paths"       => both_paths,
+        "wrong recipe schema"    => valid.merge("schema" => 2),
+      }
+      mutations.each do |label, document|
+        marker = fixture.fetch(:base)/"#{label.tr(" ", "-")}-evaluated"
+        path = write_tier2_loader_attestation(fixture, JSON.generate(document))
+        _stdout, _stderr, status = run_tier2_support_load(
+          fixture, "File.binwrite(#{marker.to_s.inspect}, \"evaluated\\n\")"
+        )
+
+        refute status.success?, label
+        refute_path_exists marker, label
+        path.chmod(0644)
+      end
+    end
+  end
+
+  def test_support_load_accepts_bounded_resource_attestation_above_legacy_limit
+    with_tier2_loader_fixture do |fixture|
+      document = tier2_loader_attestation(fixture, bridge: false, recipe: true)
+      document.fetch("tap_recipe")["resources"] = 32.times.map do |index|
+        {
+          "name"          => format("resource-%02d", index),
+          "source_sha256" => "e" * 64,
+          "source_url"    => "https://example.test/#{index}/#{"a" * 600}",
+        }
+      end
+      contents = JSON.generate(document)
+      assert_operator contents.bytesize, :>, 16_384
+      assert_operator(
+        contents.bytesize,
+        :<=,
+        KandeloFormulaSupport::KANDELO_TIER2_ATTESTATION_MAX_BYTES,
+      )
+      write_tier2_loader_attestation(fixture, contents)
+      marker = fixture.fetch(:base)/"large-resource-attestation-evaluated"
+
+      _stdout, stderr, status = run_tier2_support_load(
+        fixture,
+        "File.binwrite(#{marker.to_s.inspect}, \"evaluated\\n\")",
+        simulated_owner_uid: 0,
+      )
+
+      assert status.success?, stderr
+      assert_path_exists marker
     end
   end
 
@@ -1293,6 +2802,10 @@ class KandeloFormulaSupportTest < Minitest::Test
         "support hash"        => JSON.generate(valid.merge("support_sha256" => "f" * 64)),
         "support runtime hash" => JSON.generate(valid.merge("support_runtime_sha256" => "f" * 64)),
         "trailing JSON value" => "#{valid_json} true",
+        "oversized document"  => valid_json.ljust(
+          KandeloFormulaSupport::KANDELO_TIER2_ATTESTATION_MAX_BYTES + 1,
+          " ",
+        ),
       }
       mutations.each do |label, contents|
         marker = fixture.fetch(:base)/"#{label.tr(" ", "-")}-evaluated"
