@@ -1,0 +1,13 @@
+{
+  "schema": 1,
+  "formula": "m4-canary",
+  "arch": "wasm32",
+  "release_tag": "bottles-abi-v42",
+  "status": "failed",
+  "attempted_at": "2026-08-03T21:28:23Z",
+  "attempted_by": "https://github.com/brandonpayton/homebrew-kandelo-canary/actions/runs/30852503718",
+  "kandelo_commit": "89c18589c848f3f3e017080a3ea8ba5cf68d105f",
+  "tap_commit": "304608ca823bc9144fd564767ad83848dbffc3c7",
+  "error": "publish-handoff=success; validate-payload=success; publish=failure",
+  "error_detail": "Preparing worktree (detached HEAD 304608c)\nPreparing worktree (detached HEAD 304608c)\nPreparing worktree (detached HEAD 304608c)\nwarning: function `activate_index` is never used\n   --> tools/xtask/src/index_candidate.rs:325:4\n    |\n325 | fn activate_index(\n    |    ^^^^^^^^^^^^^^\n    |\n    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default\n\nwarning: function `activate_index` is never used\n   --> tools/xtask/src/index_candidate.rs:325:4\n    |\n325 | fn activate_index(\n    |    ^^^^^^^^^^^^^^\n    |\n    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default\n\nxtask homebrew-validate: homebrew metadata validation failed with 8 error(s):\n- package m4 bottle #0: prefix does not match the canonical Kandelo guest layout\n- package m4 bottle #0: cellar does not match the canonical Kandelo guest layout\n- live link manifest \"Kandelo/link/m4-1.4.21-rebuild2-wasm32.json\" is not selected by Kandelo/metadata.json\n- live link manifest \"Kandelo/link/m4-1.4.21-rebuild3-wasm32.json\" is not selected by Kandelo/metadata.json\n- live link manifest \"Kandelo/link/m4-1.4.21-rebuild1-wasm32.json\" is not selected by Kandelo/metadata.json\n- live provenance report \"Kandelo/reports/m4-1.4.21-rebuild3-wasm32.provenance.json\" is not selected by Kandelo/metadata.json\n- live provenance report \"Kandelo/reports/m4-1.4.21-rebuild1-wasm32.provenance.json\" is not selected by Kandelo/metadata.json\n- live provenance report \"Kandelo/reports/m4-1.4.21-rebuild2-wasm32.provenance.json\" is not selected by Kandelo/metadata.json\n"
+}
