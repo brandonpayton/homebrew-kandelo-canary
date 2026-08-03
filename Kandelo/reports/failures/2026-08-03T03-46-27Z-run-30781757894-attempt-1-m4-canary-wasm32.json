@@ -1,0 +1,13 @@
+{
+  "schema": 1,
+  "formula": "m4-canary",
+  "arch": "wasm32",
+  "release_tag": "bottles-abi-v42",
+  "status": "failed",
+  "attempted_at": "2026-08-03T03:46:27Z",
+  "attempted_by": "https://github.com/brandonpayton/homebrew-kandelo-canary/actions/runs/30781757894",
+  "kandelo_commit": "7dc91f293e110829aa6922a6edd02fa3e33a82c4",
+  "tap_commit": "fed9678296f36a489824a655b2b7015dcc90028f",
+  "error": "publish-handoff=success; validate-payload=failure; publish=skipped",
+  "error_detail": "homebrew-publish-handoff-paths.sh: artifact root is not a regular directory\n"
+}
