@@ -1,0 +1,53 @@
+{
+  "arch": "wasm32",
+  "bottle": {
+    "bytes": 467734,
+    "cache_key_sha": "11e829d87480bb250cf524c1bb7e9f13ef5f51c7a7075af2efe36898049243d3",
+    "payload_root": "m4-canary/1.4.21",
+    "sha256": "11e829d87480bb250cf524c1bb7e9f13ef5f51c7a7075af2efe36898049243d3",
+    "url": "https://ghcr.io/v2/brandonpayton/homebrew-kandelo-canary/m4-canary/blobs/sha256:11e829d87480bb250cf524c1bb7e9f13ef5f51c7a7075af2efe36898049243d3"
+  },
+  "cellar": "/opt/kandelo/homebrew/Cellar",
+  "env": {
+    "PATH_prepend": [
+      "bin"
+    ]
+  },
+  "kandelo_abi": 42,
+  "keg": "/opt/kandelo/homebrew/Cellar/m4-canary/1.4.21",
+  "links": [
+    {
+      "source": "bin/m4",
+      "target": "bin/m4",
+      "type": "symlink"
+    },
+    {
+      "source": "share/info/m4.info",
+      "target": "share/info/m4.info",
+      "type": "symlink"
+    },
+    {
+      "source": "share/info/m4.info-1",
+      "target": "share/info/m4.info-1",
+      "type": "symlink"
+    },
+    {
+      "source": "share/info/m4.info-2",
+      "target": "share/info/m4.info-2",
+      "type": "symlink"
+    },
+    {
+      "source": "share/man/man1/m4.1",
+      "target": "share/man/man1/m4.1",
+      "type": "symlink"
+    }
+  ],
+  "package": "m4-canary",
+  "prefix": "/opt/kandelo/homebrew",
+  "receipts": [
+    ".brew/m4-canary.rb",
+    "INSTALL_RECEIPT.json"
+  ],
+  "schema": 1,
+  "version": "1.4.21"
+}

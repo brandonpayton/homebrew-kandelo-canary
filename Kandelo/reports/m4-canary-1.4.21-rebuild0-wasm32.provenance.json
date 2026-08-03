@@ -1,0 +1,115 @@
+{
+  "bottle": {
+    "bottle_tag": "wasm32_kandelo",
+    "bytes": 467734,
+    "cache_key_sha": "11e829d87480bb250cf524c1bb7e9f13ef5f51c7a7075af2efe36898049243d3",
+    "cellar": "/opt/kandelo/homebrew/Cellar",
+    "prefix": "/opt/kandelo/homebrew",
+    "sha256": "11e829d87480bb250cf524c1bb7e9f13ef5f51c7a7075af2efe36898049243d3",
+    "url": "https://ghcr.io/v2/brandonpayton/homebrew-kandelo-canary/m4-canary/blobs/sha256:11e829d87480bb250cf524c1bb7e9f13ef5f51c7a7075af2efe36898049243d3"
+  },
+  "build": {
+    "brew_version": "Homebrew source commit a92554a538e81fad0c5074443885dbcc4c36221d",
+    "dev_shell": "scripts/dev-shell.sh",
+    "github_run": "https://github.com/brandonpayton/homebrew-kandelo-canary/actions/runs/30852503718",
+    "job": "verify-bottle",
+    "runner_os": "Linux",
+    "sdk_fingerprint": "a7ef0c406359039ee25d54e4f8baee3afdc857cdbcac5df9a065ef875b3a3b48",
+    "sysroot_fingerprint": "909ba2b77222de5bef3b06bc0c42595c0f0aa1446150fbf988a3f7cb3d649565"
+  },
+  "formula": {
+    "path": "Formula/m4-canary.rb",
+    "sha256": "62ae36490e1c0078d6cd2419c73ab7d30cfad7333a397e38dd52d6ca3ddeda37"
+  },
+  "metadata": {
+    "formula_json": {
+      "path": "Kandelo/formula/m4-canary.json",
+      "sha256": "1acf1344ba690d12d5837af7bf0af842658a918e4ef2f95a63e777507a430f2e"
+    },
+    "link_manifest_json": {
+      "path": "Kandelo/link/m4-canary-1.4.21-rebuild0-wasm32.json",
+      "sha256": "b93baa2180b916eb8607e2b023d2c433728ee949d84aad7f54a6a81625fb132d"
+    },
+    "metadata_json": {
+      "path": "Kandelo/metadata.json",
+      "sha256": "994106a2b8462416c381592988d6b8e214fd6bc8156d397a2f8da7015e2cc309"
+    },
+    "provenance_json": {
+      "path": "Kandelo/reports/m4-canary-1.4.21-rebuild0-wasm32.provenance.json",
+      "sha256": "983ede36a04bd81ab471674218097f89b31a617eeff4131e5135f53a5d6fb855"
+    }
+  },
+  "repositories": {
+    "kandelo_commit": "89c18589c848f3f3e017080a3ea8ba5cf68d105f",
+    "kandelo_repository": "Automattic/kandelo",
+    "tap_commit": "304608ca823bc9144fd564767ad83848dbffc3c7",
+    "tap_repository": "brandonpayton/homebrew-kandelo-canary"
+  },
+  "schema": 1,
+  "subject": {
+    "arch": "wasm32",
+    "bottle_rebuild": 0,
+    "kandelo_abi": 42,
+    "package": "m4-canary",
+    "version": "1.4.21"
+  },
+  "validation": {
+    "outcome_lists": [
+      {
+        "failed": [],
+        "name": "schema",
+        "passed": [
+          "Kandelo/metadata.json",
+          "Kandelo/formula/m4-canary.json",
+          "Kandelo/link/m4-canary-1.4.21-rebuild0-wasm32.json",
+          "Kandelo/reports/m4-canary-1.4.21-rebuild0-wasm32.provenance.json"
+        ],
+        "skipped": [],
+        "status": "success"
+      },
+      {
+        "failed": [],
+        "name": "homebrew_audit",
+        "passed": [],
+        "skip_reason": "kd-8ho.5 validates the first bottle build and sidecars; tap audit can run in the real tap publication gate.",
+        "skipped": [
+          "brew audit was not part of kd-8ho.5 local verification"
+        ],
+        "status": "skipped"
+      },
+      {
+        "failed": [],
+        "name": "bottle_build",
+        "passed": [
+          "brew install --build-bottle",
+          "brew test",
+          "brew bottle --json --keep-old",
+          "scripts/homebrew-merge-bottle-json.sh statically composed canonical bottle metadata"
+        ],
+        "skipped": [],
+        "status": "success"
+      },
+      {
+        "failed": [],
+        "name": "node_smoke",
+        "passed": [
+          "Homebrew force-poured m4-canary from anonymous-public-readback",
+          "brew test emitted Kandelo Node receipt via kandelo_run_wasm",
+          "exact bottle sha256: 11e829d87480bb250cf524c1bb7e9f13ef5f51c7a7075af2efe36898049243d3"
+        ],
+        "skipped": [],
+        "status": "success"
+      },
+      {
+        "failed": [],
+        "name": "browser_smoke",
+        "passed": [],
+        "skip_reason": "No successful browser VFS smoke was recorded for this bottle.",
+        "skipped": [
+          "browser_compatible is false for this bottle"
+        ],
+        "status": "skipped"
+      }
+    ]
+  }
+}

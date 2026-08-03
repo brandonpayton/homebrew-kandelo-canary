@@ -71,6 +71,12 @@ class M4Canary < Formula
         stdin: source,
       )
   end
+
+  bottle do
+    root_url "https://ghcr.io/v2/brandonpayton/homebrew-kandelo-canary"
+    sha256 cellar: :any_skip_relocation, wasm32_kandelo: "11e829d87480bb250cf524c1bb7e9f13ef5f51c7a7075af2efe36898049243d3"
+  end
+
 end
 
 __END__
